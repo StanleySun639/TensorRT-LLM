@@ -13,6 +13,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 from .._utils import nvtx_range_debug
@@ -31,7 +32,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PybindMirror,
-                       TorchLlmArgs, TrtLlmArgs, _AutoDeployLlmArgs)
+                       TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -125,7 +126,9 @@ class BaseLLM:
             if backend == 'pytorch':
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
-                llm_args_cls = _AutoDeployLlmArgs
+                from .._torch.auto_deploy.llm_args import \
+                    LlmArgs as AutoDeployLlmArgs
+                llm_args_cls = AutoDeployLlmArgs
             else:
                 llm_args_cls = TrtLlmArgs
 
@@ -321,6 +324,11 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
+
+        # Check if the worker is shutting down
+        if self._executor is None or self._executor.is_shutdown():
+            raise RuntimeError("LLM is shutting down")
+
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
@@ -350,9 +358,8 @@ class BaseLLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
-        multimodal_input = None
-        multimodal_embedding = None
-        mrope_config = None
+        multimodal_params = None
+
         if "prompt_token_ids" in inputs:
             # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
             prompt_token_ids = inputs['prompt_token_ids']
@@ -377,11 +384,15 @@ class BaseLLM:
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
-                multimodal_embedding = extra_processed_inputs.get(
-                    'mm_embedding')
-                mrope_config = extra_processed_inputs.get('mrope_config')
-                multimodal_input = extra_processed_inputs.get(
-                    'multimodal_input')
+                # Create unified MultimodalParams
+                multimodal_params = MultimodalParams(
+                    multimodal_input=extra_processed_inputs.get(
+                        'multimodal_input'),
+                    multimodal_data=extra_processed_inputs.get(
+                        'multimodal_data'))
+                # Only pass it if it has content
+                if not multimodal_params.has_content():
+                    multimodal_params = None
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -401,12 +412,10 @@ class BaseLLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
-            multimodal_input=multimodal_input,
-            multimodal_embedding=multimodal_embedding,
-            mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
+            multimodal_params=multimodal_params,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
@@ -490,8 +499,8 @@ class BaseLLM:
                 raise ValueError(
                     "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
                 )
-            return SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                  pad_id=self.tokenizer.pad_token_id)
+            sampling_params = SamplingParams(end_id=self.tokenizer.eos_token_id,
+                                             pad_id=self.tokenizer.pad_token_id)
         elif isinstance(sampling_params, SamplingParams):
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
@@ -499,20 +508,25 @@ class BaseLLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
-            # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-            if self.args.backend not in ["pytorch", "_autodeploy"]:
-                if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                    sampling_params.return_context_logits = True
-                    sampling_params._context_logits_auto_enabled = True
-                if sampling_params.logprobs and not sampling_params.return_generation_logits:
-                    sampling_params.return_generation_logits = True
-                    sampling_params._generation_logits_auto_enabled = True
-
-            return sampling_params
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
+
+        # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+        if self.args.backend not in ["pytorch", "_autodeploy"]:
+            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                sampling_params.return_context_logits = True
+                sampling_params._context_logits_auto_enabled = True
+            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                sampling_params.return_generation_logits = True
+                sampling_params._generation_logits_auto_enabled = True
+
+        if sampling_params._stream_interval is None:
+            sampling_params._stream_interval = getattr(self.args,
+                                                       "stream_interval", 1)
+
+        return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
@@ -528,8 +542,6 @@ class BaseLLM:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
-            return
-        elif self.args.backend == "_autodeploy":
             return
 
         build_config = self.args.build_config

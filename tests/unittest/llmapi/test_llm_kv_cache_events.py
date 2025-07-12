@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 import tensorrt_llm
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -48,7 +50,7 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
-               autotuner_enabled=False,
+               enable_autotuner=False,
                backend="pytorch")
 
 
