@@ -30,6 +30,7 @@ try:
     from opentelemetry.context.context import Context
     from opentelemetry.sdk.environment_variables import \
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+    from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.trace import (SpanKind, Status, StatusCode, Tracer,
@@ -67,7 +68,13 @@ def init_tracer(instrumenting_module_name: str,
             "OpenTelemetry is not available. Unable to initialize "
             "a tracer. Ensure OpenTelemetry packages are installed. "
             f"Original error:\n{otel_import_error_traceback}")
-    trace_provider = TracerProvider()
+
+    # Set service name from environment variable or use default
+    service_name = os.getenv("OTEL_SERVICE_NAME", "trt-server")
+    resource = Resource.create({
+        "service.name": service_name,
+    })
+    trace_provider = TracerProvider(resource=resource)
     span_exporter = get_span_exporter(otlp_traces_endpoint)
     trace_provider.add_span_processor(BatchSpanProcessor(span_exporter))
     set_tracer_provider(trace_provider)
