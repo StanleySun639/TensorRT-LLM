@@ -14,6 +14,7 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling/test_modeling_deepseekv3.py::test_forward_mlp_pre_mlp_fusion_no_nvfp4_fallback
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention
   - unittest/_torch/compilation
