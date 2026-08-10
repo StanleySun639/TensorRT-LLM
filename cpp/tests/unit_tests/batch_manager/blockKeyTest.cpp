@@ -14,14 +14,20 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/opUtils.h"
+
 #include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <gtest/gtest.h>
+#include <set>
+#include <tuple>
+#include <unordered_map>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+using tensorrt_llm::common::op::OpCustomHash;
 
 class BlockKeyTest : public ::testing::Test
 {
@@ -304,4 +310,42 @@ TEST_F(BlockKeyTest, NumMatchingTokensFullMatch)
     BlockKey bk0(false, std::nullopt, {{0, 0}, {1, 0}, {2, 0}});
     BlockKey bk1(false, std::nullopt, {{0, 0}, {1, 0}, {2, 0}});
     EXPECT_EQ(bk0.numMatchingTokens(bk1), 3);
+}
+
+TEST(OpCustomHashTest, TupleAndSetHashCorrectness)
+{
+    using TupleType = std::tuple<int, int>;
+    OpCustomHash<TupleType> tupleHasher;
+
+    TupleType t1{42, 99};
+    TupleType t2{42, 99};
+    EXPECT_EQ(tupleHasher(t1), tupleHasher(t2));
+
+    TupleType tDiffFirst{43, 99};
+    EXPECT_NE(tupleHasher(t1), tupleHasher(tDiffFirst));
+
+    TupleType tDiffSecond{42, 100};
+    EXPECT_NE(tupleHasher(t1), tupleHasher(tDiffSecond));
+
+    std::unordered_map<TupleType, int, OpCustomHash<TupleType>> tupleMap;
+    tupleMap[t1] = 7;
+    EXPECT_EQ(tupleMap.count(t2), 1u);
+    EXPECT_EQ(tupleMap[t2], 7);
+    EXPECT_EQ(tupleMap.count(tDiffFirst), 0u);
+    EXPECT_EQ(tupleMap.count(tDiffSecond), 0u);
+
+    OpCustomHash<std::set<int>> setHasher;
+
+    std::set<int> s1{1, 2, 3};
+    std::set<int> s2{1, 2, 3};
+    EXPECT_EQ(setHasher(s1), setHasher(s2));
+
+    std::set<int> sDiff{1, 2, 4};
+    EXPECT_NE(setHasher(s1), setHasher(sDiff));
+
+    std::unordered_map<std::set<int>, int, OpCustomHash<std::set<int>>> setMap;
+    setMap[s1] = 42;
+    EXPECT_EQ(setMap.count(s2), 1u);
+    EXPECT_EQ(setMap[s2], 42);
+    EXPECT_EQ(setMap.count(sDiff), 0u);
 }
