@@ -15,13 +15,17 @@
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
 from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
 
+from tensorrt_llm.bench.tuning.dataclasses import ModelConfig
+from tensorrt_llm.bench.tuning.heuristics import BYTES_PER_ELEM, calc_engine_setting
 from tensorrt_llm.commands.bench import main
+from tensorrt_llm.llmapi.llm_utils import QuantConfig
 
 _PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
 
@@ -125,3 +129,88 @@ def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
 
         dataset_path = prepare_dataset(llm_root, temp_dir, args["model"])
         run_benchmark(model_name, str(args["model"]), dataset_path, extra_llm_api_options_path)
+
+
+@pytest.mark.cpu_only
+@patch("tensorrt_llm.bench.tuning.heuristics.get_device_memory")
+def test_mla_branch_yields_larger_batch_and_tokens(mock_get_device_memory):
+    mock_get_device_memory.return_value = 25.0
+
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    num_attention_layers = 60
+    num_attention_heads = 64
+
+    mla_config = ModelConfig(
+        name="deepseek-test",
+        model_type="deepseek_v3",
+        num_hidden_layers=60,
+        num_attention_layers=num_attention_layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=64,
+        head_size=128,
+        hidden_size=7168,
+        vocab_size=102400,
+        param_count=2_000_000_000,
+        max_position_embeddings=4096,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    non_mla_config = ModelConfig(
+        name="deepseek-test-nomla",
+        model_type="llama",
+        num_hidden_layers=60,
+        num_attention_layers=num_attention_layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=64,
+        head_size=128,
+        hidden_size=7168,
+        vocab_size=102400,
+        param_count=2_000_000_000,
+        max_position_embeddings=4096,
+    )
+
+    assert mla_config.is_mla() is True
+    assert non_mla_config.is_mla() is False
+
+    quant_config = QuantConfig()
+    tp_size = 1
+    pp_size = 1
+    target_input_len = 512
+    target_output_len = 512
+
+    mla_bs, mla_tokens = calc_engine_setting(
+        model_config=mla_config,
+        quant_config=quant_config,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        target_input_len=target_input_len,
+        target_output_len=target_output_len,
+    )
+
+    non_mla_bs, non_mla_tokens = calc_engine_setting(
+        model_config=non_mla_config,
+        quant_config=quant_config,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        target_input_len=target_input_len,
+        target_output_len=target_output_len,
+    )
+
+    byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
+    expected_mla_gb_per_token = (
+        num_attention_layers * (kv_lora_rank + qk_rope_head_dim) * byte_per_kv_elem / (1024**3)
+    )
+    adjusted_num_kv_heads = max(tp_size, non_mla_config.num_key_value_heads)
+    expected_non_mla_gb_per_token = (
+        2
+        * num_attention_layers
+        * adjusted_num_kv_heads
+        * non_mla_config.head_size
+        * byte_per_kv_elem
+        / (1024**3)
+    )
+    assert expected_mla_gb_per_token < expected_non_mla_gb_per_token
+
+    assert mla_bs > non_mla_bs
+    assert mla_tokens > non_mla_tokens
