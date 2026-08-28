@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions, occurrence_penalized_logits
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyHandler
 
 apply_batched_occurrence_penalties = Fusions.apply_batched_occurrence_penalties
@@ -320,6 +320,41 @@ def test_penalty_op_does_not_latch_pending_token() -> None:
     # With has_previous_token False and counts all zero, no penalty may be applied; the
     # stale token in particular must not be folded (would perturb logits[2500]).
     torch.testing.assert_close(logits, original, rtol=0, atol=0)
+
+
+def test_shared_penalty_formula_preserves_non_finite_logits() -> None:
+    repetition = torch.tensor([[2.0]], device="cuda")
+    presence = torch.tensor([[0.5]], device="cuda")
+    frequency = torch.tensor([[0.25]], device="cuda")
+    logits = torch.tensor([[2.0, -3.0, float("-inf"), 1.0, 4.0, -1.0]], device="cuda")
+    count = torch.tensor([[3, 2, 5, 0, 1, 0]], dtype=torch.int32, device="cuda")
+    seen_for_presence = count > 0
+    # Column 3 stands for a prompt-prefix token excluded by prompt_ignore_length: seen
+    # for repetition, but never counted for presence/frequency.
+    seen_for_repetition = seen_for_presence.clone()
+    seen_for_repetition[0, 3] = True
+
+    got = occurrence_penalized_logits(
+        logits,
+        count=count,
+        seen_for_repetition=seen_for_repetition,
+        seen_for_presence=seen_for_presence,
+        repetition=repetition,
+        presence=presence,
+        frequency=frequency,
+    )
+
+    assert bool(torch.isneginf(got[0, 2])), got[0, 2].item()
+    finite_columns = torch.tensor([0, 1, 4, 5], device="cuda")
+    torch.testing.assert_close(
+        got[0, finite_columns],
+        torch.tensor([-0.25, -7.0, 1.25, -1.0], device="cuda"),
+        rtol=0,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(got[0, 3], torch.tensor(0.5, device="cuda"), rtol=0, atol=1e-6)
+    # A wrongly applied presence subtraction would move this entry to 0.0.
+    assert abs(got[0, 3].item()) > 1e-6
 
 
 def _make_handler_request(
