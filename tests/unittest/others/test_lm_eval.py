@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -49,6 +50,7 @@ from tensorrt_llm.evaluate.lm_eval import (
     MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
+    _replace_fuzzywuzzy_with_rapidfuzz,
 )
 from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     is_equiv,
@@ -62,6 +64,61 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
+
+# ===========================================================================
+# _replace_fuzzywuzzy_with_rapidfuzz context manager
+# ===========================================================================
+
+
+def test_replace_fuzzywuzzy_shim_injects_rapidfuzz_fuzz():
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
+
+    saved = sys.modules.pop("fuzzywuzzy", None)
+    try:
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            assert "fuzzywuzzy" in sys.modules
+            shim_module = sys.modules["fuzzywuzzy"]
+            assert shim_module.fuzz is rapidfuzz_fuzz
+
+            from fuzzywuzzy import fuzz  # noqa: E402
+
+            assert fuzz is rapidfuzz_fuzz
+            score = fuzz.ratio("hello", "hallo")  # codespell:ignore hallo
+            assert isinstance(score, (int, float))
+            assert score > 0
+    finally:
+        if saved is not None:
+            sys.modules["fuzzywuzzy"] = saved
+        else:
+            sys.modules.pop("fuzzywuzzy", None)
+
+
+def test_replace_fuzzywuzzy_shim_restores_sys_modules_on_exit():
+    from types import ModuleType
+
+    saved = sys.modules.pop("fuzzywuzzy", None)
+    try:
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            assert "fuzzywuzzy" in sys.modules
+        assert "fuzzywuzzy" not in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["fuzzywuzzy"] = saved
+        else:
+            sys.modules.pop("fuzzywuzzy", None)
+
+    sentinel_module = ModuleType("fuzzywuzzy")
+    sentinel_module.custom_attr = "sentinel"
+    sys.modules["fuzzywuzzy"] = sentinel_module
+    try:
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            assert sys.modules["fuzzywuzzy"] is not sentinel_module
+        assert sys.modules["fuzzywuzzy"] is sentinel_module
+    finally:
+        if saved is not None:
+            sys.modules["fuzzywuzzy"] = saved
+        else:
+            sys.modules.pop("fuzzywuzzy", None)
 
 
 # ===========================================================================
