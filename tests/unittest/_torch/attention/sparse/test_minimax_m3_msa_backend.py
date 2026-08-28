@@ -7,6 +7,7 @@ HND view contract passed to the packaged MSA kernel. Numerical parity against
 the Triton reference is covered by the SM100 integration accuracy test.
 """
 
+import importlib.util
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +25,32 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
+
+
+@pytest.mark.cpu_only
+def test_msa_package_available_caches_find_spec(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    find_spec_calls = []
+
+    def counting_find_spec(name, package=None):
+        find_spec_calls.append(name)
+        return object()
+
+    monkeypatch.setattr(importlib.util, "find_spec", counting_find_spec)
+    # The memoized value is process-wide, so clear it on both sides of the probe
+    # to keep the patched result out of the other tests in this module.
+    msa_package_available.cache_clear()
+    try:
+        results = [msa_package_available() for _ in range(3)]
+    finally:
+        msa_package_available.cache_clear()
+
+    assert find_spec_calls == ["fmha_sm100"]
+    assert results[0] is True
+    assert results == [results[0]] * 3
 
 
 def test_msa_requires_block_size_128():
