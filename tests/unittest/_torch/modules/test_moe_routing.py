@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 import pickle
 import sys
@@ -397,6 +399,106 @@ def test_static_moe_routing():
             scales,
             torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
                          dtype=torch.float32))
+
+
+def _make_minimax_m2_routing(routing_cls, top_k, bias):
+    return routing_cls(
+        top_k=top_k,
+        num_experts=bias.numel(),
+        callable_e_score_correction_bias=lambda: bias,
+    )
+
+
+@pytest.mark.cpu_only
+def test_sqrt_softplus_routing_requires_separated_python_path():
+    from tensorrt_llm._torch.modules.fused_moe.routing import (
+        RoutingMethodType, SqrtSoftplusMoeRoutingMethod)
+
+    bias = torch.zeros(4, dtype=torch.float32)
+    sqrt_routing = _make_minimax_m2_routing(SqrtSoftplusMoeRoutingMethod,
+                                            top_k=2,
+                                            bias=bias)
+    minimax_routing = _make_minimax_m2_routing(MiniMaxM2MoeRoutingMethod,
+                                               top_k=2,
+                                               bias=bias)
+
+    assert sqrt_routing.requires_separated_routing is True
+
+    assert sqrt_routing.routing_method_type == RoutingMethodType.MiniMax2
+
+    assert minimax_routing.requires_separated_routing is False
+
+    # Precedence: both conditions are active on the same sqrt_routing instance
+    # (routing_method_type==MiniMax2 AND requires_separated_routing==True).
+    # The separated Python path (get_scores) wins: sqrt_routing.get_scores
+    # produces sqrt-softplus, NOT sigmoid.
+    logits = torch.tensor([[5.0, 1.0, -1.0, 3.0]], dtype=torch.float32)
+
+    sqrt_scores, _ = sqrt_routing.get_scores(
+        logits, sqrt_routing.e_score_correction_bias)
+    expected_sqrt_softplus = torch.sqrt(F.softplus(logits.float()))
+    torch.testing.assert_close(sqrt_scores, expected_sqrt_softplus)
+
+    minimax_scores, _ = minimax_routing.get_scores(
+        logits, minimax_routing.e_score_correction_bias)
+    expected_sigmoid = torch.sigmoid(logits.float())
+    torch.testing.assert_close(minimax_scores, expected_sigmoid)
+
+    assert not torch.allclose(sqrt_scores, minimax_scores)
+
+
+@pytest.mark.cpu_only
+def test_sqrt_softplus_routing_applies_sqrt_softplus_scores():
+    from tensorrt_llm._torch.modules.fused_moe.routing import \
+        SqrtSoftplusMoeRoutingMethod
+
+    top_k = 2
+    logits = torch.tensor([[10.0, 0.0, -2.0, -4.0]], dtype=torch.float32)
+    bias = torch.tensor([0.0, 0.8, 0.9, 0.0], dtype=torch.float32)
+    sqrt_routing = _make_minimax_m2_routing(SqrtSoftplusMoeRoutingMethod,
+                                            top_k=top_k,
+                                            bias=bias)
+    minimax_routing = _make_minimax_m2_routing(MiniMaxM2MoeRoutingMethod,
+                                               top_k=top_k,
+                                               bias=bias)
+
+    expected_scores = torch.sqrt(F.softplus(logits.float()))
+    expected_scores_with_bias = expected_scores + bias
+
+    scores, scores_with_bias = sqrt_routing.get_scores(
+        logits, sqrt_routing.e_score_correction_bias)
+    torch.testing.assert_close(scores, expected_scores)
+
+    torch.testing.assert_close(scores_with_bias, expected_scores_with_bias)
+
+    expected_indices = torch.topk(expected_scores_with_bias,
+                                  k=top_k,
+                                  dim=-1,
+                                  sorted=False).indices.to(torch.int32)
+    expected_weights = expected_scores.gather(1, expected_indices.long())
+    expected_weights = expected_weights / (
+        expected_weights.sum(dim=-1, keepdim=True) + 1e-20)
+
+    indices, top_k_weights = sqrt_routing.apply(logits)
+
+    indices_sorted = torch.sort(indices, dim=1).values
+    expected_indices_sorted = torch.sort(expected_indices, dim=1).values
+    assert torch.equal(indices_sorted, expected_indices_sorted)
+
+    assert top_k_weights.dtype == torch.float32
+
+    perm = torch.argsort(indices, dim=1)
+    expected_perm = torch.argsort(expected_indices, dim=1)
+    weights_sorted = top_k_weights.gather(1, perm)
+    expected_weights_sorted = expected_weights.gather(1, expected_perm)
+    torch.testing.assert_close(weights_sorted, expected_weights_sorted)
+    torch.testing.assert_close(top_k_weights.sum(dim=-1),
+                               torch.ones(1, dtype=torch.float32))
+
+    minimax_indices, minimax_weights = minimax_routing.apply(logits)
+    minimax_indices_sorted = torch.sort(minimax_indices, dim=1).values
+    assert not torch.equal(indices_sorted, minimax_indices_sorted)
+    assert not torch.allclose(top_k_weights, minimax_weights)
 
 
 def _make_v3_routing(top_k, n_group, topk_group, num_experts):
