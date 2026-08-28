@@ -16,10 +16,14 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_kimi_k3_multimodal_config,
     load_pretrained_config,
@@ -145,6 +149,63 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
         self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
         self.assertEqual(config.model_type, "kimi_linear")
         self.assertEqual(config.hidden_size, 7168)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("device_type", ["cuda", "cpu"])
+def test_load_weights_synchronizes_cuda_device_after_loading(device_type):
+    call_order = []
+
+    if device_type == "cuda":
+        mock_device = torch.device("cuda", 0)
+    else:
+        mock_device = torch.device("cpu")
+
+    mock_param = MagicMock()
+    mock_param.device = mock_device
+
+    model = object.__new__(KimiLinearForCausalLM)
+
+    model._trunk_parameters = lambda: {"p": mock_param}
+    model.checkpoint_name_plan = lambda prefix: ({}, set(), [])
+    model._validate_checkpoint_keys = lambda w, ek, p: None
+
+    def fake_load_trunk(weights, params, name_map):
+        call_order.append("_load_trunk_params")
+        return 1
+
+    def fake_load_experts(weights, expert_jobs):
+        call_order.append("_load_expert_slices")
+
+    def fake_finalize(num_params, num_moe_layers):
+        call_order.append("_finalize_weight_load")
+
+    model._load_trunk_params = fake_load_trunk
+    model._load_expert_slices = fake_load_experts
+    model._finalize_weight_load = fake_finalize
+
+    def fake_parameters():
+        yield mock_param
+
+    model.parameters = fake_parameters
+
+    sync_mock = MagicMock(side_effect=lambda *a, **kw: call_order.append("synchronize"))
+
+    with patch("torch.cuda.synchronize", sync_mock):
+        model.load_weights({})
+
+    if device_type == "cuda":
+        sync_mock.assert_called_once_with(mock_device)
+        assert call_order.index("_load_trunk_params") < call_order.index("synchronize")
+        assert call_order.index("_load_expert_slices") < call_order.index("synchronize")
+        assert call_order.index("_finalize_weight_load") < call_order.index("synchronize")
+    else:
+        sync_mock.assert_not_called()
+        assert "synchronize" not in call_order
+
+    assert "_load_trunk_params" in call_order
+    assert "_load_expert_slices" in call_order
+    assert "_finalize_weight_load" in call_order
 
 
 if __name__ == "__main__":
