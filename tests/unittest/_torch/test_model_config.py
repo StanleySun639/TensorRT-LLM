@@ -1,11 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import errno
 import json
 import struct
+import tempfile
+import threading
 import types
 
+import filelock
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
+from tensorrt_llm._torch import model_config as model_config_module
+from tensorrt_llm._torch.model_config import (
+    _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT,
+    ModelConfig,
+    hf_remote_code_lock,
+)
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
@@ -301,3 +325,194 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
         model_config,
         _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
     )
+
+
+def test_hf_remote_code_lock_filler_holds_lock_during_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_config_module, "HF_MODULES_CACHE", str(tmp_path))
+
+    lock_file = str(tmp_path / "hf_remote_code.lock")
+
+    # --- Filler path: first caller holds the lock during the body ---
+    filler_body_count = []
+    filler_lock_held = []
+
+    with hf_remote_code_lock(timeout=5):
+        filler_body_count.append(1)
+        probe = filelock.FileLock(lock_file)
+        try:
+            probe.acquire(timeout=0)
+            filler_lock_held.append(False)
+            probe.release()
+        except filelock.Timeout:
+            filler_lock_held.append(True)
+
+    assert len(filler_body_count) == 1
+    assert filler_lock_held == [True]
+
+    # After exit the lock must be released.
+    check = filelock.FileLock(lock_file)
+    check.acquire(timeout=0)
+    check.release()
+
+    # --- Waiter path: use a subclass that releases the holder only when the
+    # bounded wait (timeout > 0) begins, ensuring the probe deterministically
+    # observes contention. ---
+    holder_ready = threading.Event()
+    holder_release = threading.Event()
+    real_file_lock = filelock.FileLock
+
+    def _hold_lock():
+        lk = real_file_lock(lock_file)
+        lk.acquire(timeout=5)
+        holder_ready.set()
+        holder_release.wait(timeout=10)
+        lk.release()
+
+    t = threading.Thread(target=_hold_lock, daemon=True)
+    t.start()
+    assert holder_ready.wait(timeout=5)
+
+    class _ReleaseHolderOnWait(real_file_lock):
+        def acquire(self, timeout=-1, **kwargs):
+            if timeout is not None and timeout > 0:
+                holder_release.set()
+            return super().acquire(timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", _ReleaseHolderOnWait)
+
+    waiter_body_count = []
+    waiter_lock_held = []
+
+    with hf_remote_code_lock(timeout=5):
+        waiter_body_count.append(1)
+        probe2 = real_file_lock(lock_file)
+        try:
+            probe2.acquire(timeout=0)
+            waiter_lock_held.append(False)
+            probe2.release()
+        except filelock.Timeout:
+            waiter_lock_held.append(True)
+
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+    assert len(waiter_body_count) == 1
+    assert waiter_lock_held == [False]
+
+
+def test_hf_remote_code_lock_bounded_wait_timeout_degrades(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_config_module, "HF_MODULES_CACHE", str(tmp_path))
+
+    acquire_calls = []
+    release_calls = []
+
+    class MockFileLock:
+        def __init__(self, path, *args, **kwargs):
+            self._path = path
+
+        def acquire(self, timeout=-1, **kwargs):
+            acquire_calls.append(("acquire", timeout))
+            raise filelock.Timeout(self._path)
+
+        def release(self, **kwargs):
+            release_calls.append("release")
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", MockFileLock)
+
+    body_executed = []
+
+    with hf_remote_code_lock(timeout=1):
+        body_executed.append(True)
+
+    # The probe (timeout=0) raises filelock.Timeout -> _try_take_lock returns
+    # False -> waiter branch -> bounded acquire(timeout=1) also raises
+    # filelock.Timeout -> swallowed, body still executes, no release.
+    assert len(body_executed) == 1
+    assert release_calls == []
+    assert len(acquire_calls) == 2
+    assert acquire_calls[0] == ("acquire", 0)
+    assert acquire_calls[1][0] == "acquire"
+    assert acquire_calls[1][1] > 0
+
+
+@pytest.mark.parametrize(
+    "first_error",
+    [
+        pytest.param(PermissionError("cache dir denied"), id="PermissionError"),
+        pytest.param(
+            OSError(errno.EACCES, "access denied"),
+            id="OSError-EACCES",
+        ),
+        pytest.param(
+            OSError(errno.EPERM, "operation not permitted"),
+            id="OSError-EPERM",
+        ),
+        pytest.param(
+            OSError(errno.ENOLCK, "no locks available"),
+            id="OSError-ENOLCK",
+        ),
+        pytest.param(
+            OSError(errno.ESTALE, "stale NFS handle"),
+            id="OSError-ESTALE",
+        ),
+        pytest.param(
+            OSError(errno.EEXIST, "file exists"),
+            id="OSError-EEXIST",
+        ),
+    ],
+)
+def test_hf_remote_code_lock_tempdir_fallback(tmp_path, monkeypatch, first_error):
+    monkeypatch.setattr(model_config_module, "HF_MODULES_CACHE", str(tmp_path))
+
+    call_count = [0]
+    paths_used = []
+
+    class MockFileLockInfraFail:
+        def __init__(self, path, *args, **kwargs):
+            self._path = path
+
+        def acquire(self, timeout=-1, **kwargs):
+            call_count[0] += 1
+            paths_used.append(self._path)
+            if call_count[0] == 1:
+                raise first_error
+            elif call_count[0] == 2:
+                raise PermissionError("tempdir denied")
+            return None
+
+        def release(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", MockFileLockInfraFail)
+
+    body_executed = []
+
+    with hf_remote_code_lock(timeout=1):
+        body_executed.append(True)
+
+    assert call_count[0] == 2
+    assert len(body_executed) == 1
+    assert paths_used[0] == str(tmp_path / "hf_remote_code.lock")
+    assert paths_used[1].startswith(tempfile.gettempdir())
+
+    # --- Non-infra OSError propagates ---
+    call_count[0] = 0
+
+    class MockFileLockNonInfra:
+        def __init__(self, path, *args, **kwargs):
+            self._path = path
+
+        def acquire(self, timeout=-1, **kwargs):
+            call_count[0] += 1
+            err = OSError("non-infra error")
+            err.errno = errno.ENOENT
+            raise err
+
+        def release(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", MockFileLockNonInfra)
+
+    with pytest.raises(OSError, match="non-infra error"):
+        with hf_remote_code_lock(timeout=1):
+            pass
