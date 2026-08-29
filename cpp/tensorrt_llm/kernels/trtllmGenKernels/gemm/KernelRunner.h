@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,46 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/config.h"
+#include <cstdint>
 #include <cuda.h>
+#include <optional>
+#include <vector>
+
+#include "tensorrt_llm/common/config.h"
 
 #include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
-#include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+struct TrtllmGenGemmProblemDimensions
+{
+    int32_t mM{0};
+    int32_t mValidM{0};
+    int32_t mN{0};
+    int32_t mValidN{0};
+    int32_t mK{0};
+    int32_t mValidK{0};
+    int32_t mRank{0};
+    int32_t mWorldSize{0};
+};
+
+inline TrtllmGenGemmProblemDimensions makeTrtllmGenGemmProblemDimensions(
+    int32_t m, int32_t n, int32_t k, bool transposeMmaOutput)
+{
+    TrtllmGenGemmProblemDimensions problemDimensions;
+    problemDimensions.mM = transposeMmaOutput ? n : m;
+    problemDimensions.mN = transposeMmaOutput ? m : n;
+    problemDimensions.mK = k;
+    problemDimensions.mValidM = transposeMmaOutput ? n : m;
+    problemDimensions.mValidN = transposeMmaOutput ? m : n;
+    problemDimensions.mValidK = k;
+    problemDimensions.mRank = 0;
+    problemDimensions.mWorldSize = 1;
+    return problemDimensions;
+}
 
 struct TrtllmGenGemmRunnerOptions
 {

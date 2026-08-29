@@ -94,15 +94,16 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
 
 size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k)
 {
+    auto const problemDimensions = makeTrtllmGenGemmProblemDimensions(m, n, k, mOptions.transposeMmaOutput);
     GemmData gemmData;
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mK = k;
-    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mValidK = k;
-    gemmData.mProblemDimensions.mRank = 0;
-    gemmData.mProblemDimensions.mWorldSize = 1;
+    gemmData.mProblemDimensions.mM = problemDimensions.mM;
+    gemmData.mProblemDimensions.mN = problemDimensions.mN;
+    gemmData.mProblemDimensions.mK = problemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = problemDimensions.mValidM;
+    gemmData.mProblemDimensions.mValidN = problemDimensions.mValidN;
+    gemmData.mProblemDimensions.mValidK = problemDimensions.mValidK;
+    gemmData.mProblemDimensions.mRank = problemDimensions.mRank;
+    gemmData.mProblemDimensions.mWorldSize = problemDimensions.mWorldSize;
 
     selectGemmConfig(m, n, k);
 
@@ -128,14 +129,15 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     auto const& config = configs[mSelectedConfigIndex.value()];
 
     // Dims
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mK = k;
-    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mValidK = k;
-    gemmData.mProblemDimensions.mRank = 0;
-    gemmData.mProblemDimensions.mWorldSize = 1;
+    auto const problemDimensions = makeTrtllmGenGemmProblemDimensions(m, n, k, mOptions.transposeMmaOutput);
+    gemmData.mProblemDimensions.mM = problemDimensions.mM;
+    gemmData.mProblemDimensions.mN = problemDimensions.mN;
+    gemmData.mProblemDimensions.mK = problemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = problemDimensions.mValidM;
+    gemmData.mProblemDimensions.mValidN = problemDimensions.mValidN;
+    gemmData.mProblemDimensions.mValidK = problemDimensions.mValidK;
+    gemmData.mProblemDimensions.mRank = problemDimensions.mRank;
+    gemmData.mProblemDimensions.mWorldSize = problemDimensions.mWorldSize;
 
     // Inputs
     gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
@@ -173,15 +175,16 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
     auto const configs = gemm.getGemmConfigs();
 
     GemmData gemmData;
+    auto const problemDimensions = makeTrtllmGenGemmProblemDimensions(m, n, k, mOptions.transposeMmaOutput);
     // Dims
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mK = k;
-    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
-    gemmData.mProblemDimensions.mValidK = k;
-    gemmData.mProblemDimensions.mRank = 0;
-    gemmData.mProblemDimensions.mWorldSize = 1;
+    gemmData.mProblemDimensions.mM = problemDimensions.mM;
+    gemmData.mProblemDimensions.mN = problemDimensions.mN;
+    gemmData.mProblemDimensions.mK = problemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = problemDimensions.mValidM;
+    gemmData.mProblemDimensions.mValidN = problemDimensions.mValidN;
+    gemmData.mProblemDimensions.mValidK = problemDimensions.mValidK;
+    gemmData.mProblemDimensions.mRank = problemDimensions.mRank;
+    gemmData.mProblemDimensions.mWorldSize = problemDimensions.mWorldSize;
 
     int const gpuSM = tensorrt_llm::common::getSMVersion();
 
