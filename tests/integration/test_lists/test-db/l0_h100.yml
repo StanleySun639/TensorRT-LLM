@@ -22,6 +22,7 @@ l0_h100:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
+  - unittest/_torch/modeling/test_modeling_bart.py::test_bart_for_conditional_generation_construction_and_forward
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
