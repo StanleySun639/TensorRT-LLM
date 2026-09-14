@@ -25,7 +25,14 @@ import pytest
 import torch
 from transformers import WhisperConfig, WhisperFeatureExtractor
 
-from tensorrt_llm._torch.models.modeling_whisper import WhisperLogMelFrontend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import get_model_architecture
+from tensorrt_llm._torch.models.modeling_whisper import (
+    WhisperForConditionalGeneration,
+    WhisperLogMelFrontend,
+)
 
 
 def _synthetic_waveform_batch(n_samples: int, seed: int = 1234) -> np.ndarray:
@@ -119,3 +126,112 @@ def test_log_mel_frontend_does_not_mutate_input():
     snapshot = batch.clone()
     frontend(batch)
     torch.testing.assert_close(batch, snapshot, atol=0.0, rtol=0.0)
+
+
+def _tiny_whisper_model_config() -> "ModelConfig":
+    config = WhisperConfig(
+        vocab_size=64,
+        num_mel_bins=80,
+        d_model=32,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        decoder_layers=1,
+        decoder_attention_heads=2,
+        encoder_ffn_dim=64,
+        decoder_ffn_dim=64,
+        max_source_positions=16,
+        max_target_positions=16,
+        torch_dtype=torch.float16,
+        architectures=["WhisperForConditionalGeneration"],
+    )
+    return ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        is_generation=True,
+        is_encoder_decoder=True,
+    )
+
+
+def _decoder_forward_logits(
+    model: WhisperForConditionalGeneration,
+    token_ids: list[int],
+    encoder_hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    device = torch.device("cuda")
+    seq_len = len(token_ids)
+    encoder_len = encoder_hidden_states.shape[0]
+
+    metadata_cls = get_attention_backend(model.model_config.attn_backend).Metadata
+    attn_metadata = metadata_cls(
+        max_num_requests=1,
+        max_num_tokens=seq_len,
+        max_num_sequences=1,
+        kv_cache_manager=None,
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        seq_lens_kv=torch.tensor([seq_len], dtype=torch.int32),
+        num_contexts=1,
+        kv_cache_params=KVCacheParams(use_cache=False),
+        max_seq_len=seq_len,
+    )
+    attn_metadata.prepare()
+
+    cross_attn_metadata = attn_metadata.create_cross_metadata([encoder_len])
+    cross_attn_metadata.max_seq_len = encoder_len
+    cross_attn_metadata.prepare()
+
+    input_ids = torch.tensor(token_ids, dtype=torch.int32, device=device)
+    position_ids = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
+
+    return model.forward(
+        attn_metadata=attn_metadata,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        encoder_hidden_states=encoder_hidden_states,
+        cross_attn_metadata=cross_attn_metadata,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_whisper_for_conditional_generation_construction_and_forward():
+    model_config = _tiny_whisper_model_config()
+
+    resolved_cls, _ = get_model_architecture(model_config.pretrained_config)
+    assert resolved_cls is WhisperForConditionalGeneration
+
+    torch.manual_seed(0)
+    model = WhisperForConditionalGeneration(model_config).to("cuda").eval()
+
+    assert model.model.decoder is not None
+    assert model.model.encoder is not None
+    assert model.lm_head.weight is model.model.decoder.embed_tokens.weight
+
+    config = model_config.pretrained_config
+
+    def _encoder_context(seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        return torch.randn(
+            config.max_source_positions,
+            config.d_model,
+            dtype=config.torch_dtype,
+            device="cuda",
+            generator=gen,
+        )
+
+    encoder_context = _encoder_context(seed=11)
+    encoder_context_other = _encoder_context(seed=22)
+
+    tokens_a = [1, 2, 3]
+    tokens_b = [5, 6, 7]
+
+    with torch.inference_mode():
+        logits_a = _decoder_forward_logits(model, tokens_a, encoder_context)
+        logits_b = _decoder_forward_logits(model, tokens_b, encoder_context)
+        logits_a_other_ctx = _decoder_forward_logits(model, tokens_a, encoder_context_other)
+
+    assert logits_a.shape[-1] == config.vocab_size
+    assert logits_a.dtype == torch.float32
+    assert torch.isfinite(logits_a).all()
+    assert torch.isfinite(logits_b).all()
+    assert torch.isfinite(logits_a_other_ctx).all()
+    assert not torch.allclose(logits_a, logits_b)
+    assert not torch.allclose(logits_a, logits_a_other_ctx)
