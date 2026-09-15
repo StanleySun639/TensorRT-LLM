@@ -10,7 +10,7 @@ import pytest
 import torch
 from huggingface_hub.errors import StrictDataclassClassValidationError
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Exaone4Config
 from utils.llm_data import llm_models_root
 
 try:
@@ -21,15 +21,20 @@ except ImportError:
     # Falls back to skipping HF-vs-TRT-LLM comparison on transformers < 5.8.
     HFExaone4_5ForConditionalGeneration = None
 
-from tensorrt_llm._torch.model_config import _mirror_text_subconfig_attrs
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig, _mirror_text_subconfig_attrs
 from tensorrt_llm._torch.models.checkpoints.hf.exaone4_5_weight_mapper import (
     Exaone4_5HfWeightMapper,
 )
+from tensorrt_llm._torch.models.modeling_exaone4 import Exaone4DecoderLayer, Exaone4ForCausalLM
 from tensorrt_llm._torch.models.modeling_exaone4_5 import (
     Exaone4_5_ForConditionalGeneration,
     Exaone4_5Config,
 )
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 
 # Reduced-size config for fast unit testing. Layer counts are shrunk so the
 # random-init HF model + TRT-LLM model fit on a single GPU while still
@@ -111,6 +116,81 @@ EXAONE_4_5_TEST_CONFIG = {
 
 _EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
 
+EXAONE4_TEST_CONFIG = {
+    "architectures": ["Exaone4ForCausalLM"],
+    "attention_dropout": 0.0,
+    "bos_token_id": 1,
+    "dtype": "bfloat16",
+    "eos_token_id": 2,
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "initializer_range": 0.02,
+    "intermediate_size": 128,
+    "max_position_embeddings": 128,
+    "model_type": "exaone4",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "sliding_window": 16,
+    "sliding_window_pattern": "G",
+    "torch_dtype": "bfloat16",
+    "use_cache": False,
+    "vocab_size": 256,
+}
+
+
+def _build_exaone4_model_config(num_hidden_layers: int) -> ModelConfig:
+    config = copy.deepcopy(EXAONE4_TEST_CONFIG)
+    config["num_hidden_layers"] = num_hidden_layers
+    return ModelConfig(
+        pretrained_config=Exaone4Config(**config),
+        attn_backend="TRTLLM",
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+    )
+
+
+def _make_exaone4_attention_metadata(num_tokens: int) -> AttentionMetadata:
+    attn_metadata = AttentionMetadata(
+        seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        seq_lens_kv=torch.tensor([num_tokens], dtype=torch.int32),
+        num_contexts=1,
+        kv_cache_params=KVCacheParams(
+            use_cache=False,
+            num_cached_tokens_per_seq=[0],
+        ),
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        request_ids=[0],
+        prompt_lens=[num_tokens],
+        max_num_requests=1,
+        max_num_tokens=num_tokens,
+        max_num_sequences=1,
+    )
+    attn_metadata.prepare()
+    return attn_metadata
+
+
+def _copy_non_layer_weights(model: Exaone4ForCausalLM, baseline_model: Exaone4ForCausalLM) -> None:
+    model_state = model.state_dict()
+    baseline_state = baseline_model.state_dict()
+    assert all(not key.startswith("model.layers.") for key in baseline_state)
+    assert set(baseline_state).issubset(model_state)
+    with torch.no_grad():
+        for key, baseline_tensor in baseline_state.items():
+            baseline_tensor.copy_(model_state[key])
+            assert torch.equal(baseline_tensor, model_state[key])
+
+
+def _run_exaone4_forward(
+    model: Exaone4ForCausalLM, input_ids: torch.Tensor, position_ids: torch.Tensor
+) -> torch.Tensor:
+    return model.forward(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attn_metadata=_make_exaone4_attention_metadata(input_ids.size(0)),
+    )
+
 
 def test_exaone4_5_config_normalizes_trailing_mtp_layer_types():
     config = copy.deepcopy(EXAONE_4_5_TEST_CONFIG)
@@ -139,6 +219,65 @@ def test_exaone4_5_config_preserves_unexpected_layer_type_mismatch():
 
     with pytest.raises(StrictDataclassClassValidationError, match="number of layer types"):
         Exaone4_5Config(**config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_exaone4_for_causal_lm_construction_and_forward():
+    torch.manual_seed(1234)
+
+    registered_cls = MODEL_CLASS_MAPPING["Exaone4ForCausalLM"]
+    assert registered_cls is Exaone4ForCausalLM
+
+    model_config = _build_exaone4_model_config(num_hidden_layers=1)
+    model = registered_cls(model_config)
+
+    assert isinstance(model, Exaone4ForCausalLM)
+    assert model.model.num_hidden_layers == EXAONE4_TEST_CONFIG["num_hidden_layers"]
+    assert len(model.model.layers) == EXAONE4_TEST_CONFIG["num_hidden_layers"]
+    assert all(isinstance(layer, Exaone4DecoderLayer) for layer in model.model.layers)
+
+    baseline_model = registered_cls(_build_exaone4_model_config(num_hidden_layers=0))
+    _copy_non_layer_weights(model, baseline_model)
+
+    device = torch.device("cuda")
+    model = model.to(device).eval()
+    baseline_model = baseline_model.to(device).eval()
+
+    input_ids = torch.tensor(
+        [3, 7, 11, 19, 23],
+        dtype=torch.long,
+        device=device,
+    )
+    num_tokens = input_ids.size(0)
+    position_ids = torch.arange(
+        num_tokens,
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
+
+    with torch.inference_mode():
+        full_forward_output = _run_exaone4_forward(model, input_ids, position_ids)
+        baseline_forward_output = _run_exaone4_forward(
+            baseline_model,
+            input_ids,
+            position_ids,
+        )
+
+    assert isinstance(full_forward_output, torch.Tensor)
+    assert isinstance(baseline_forward_output, torch.Tensor)
+    logits = full_forward_output
+    baseline_logits = baseline_forward_output
+
+    assert logits.ndim == 2
+    assert logits.size(0) == num_tokens
+    assert logits.size(1) == EXAONE4_TEST_CONFIG["vocab_size"]
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits).all().item()
+
+    assert baseline_logits.shape == logits.shape
+    assert torch.isfinite(baseline_logits).all().item()
+    max_abs_diff = torch.max(torch.abs(logits - baseline_logits))
+    assert max_abs_diff.item() > 1e-4
 
 
 @dataclass(repr=False)
