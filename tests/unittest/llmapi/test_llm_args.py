@@ -73,6 +73,130 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from .test_llm import llama_model_path
 
 
+@torch.inference_mode()
+def test_deepseek_v32_context_forward():
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.attention.backends.interface import \
+        AttentionMetadata
+    from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+        DeepseekV3ForCausalLM, DeepseekV32Attention)
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    config = PretrainedConfig(
+        architectures=["DeepseekV32ForCausalLM"],
+        model_type="deepseek_v32",
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=128,
+        kv_lora_rank=64,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        max_position_embeddings=64,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        moe_intermediate_size=128,
+        n_routed_experts=None,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(pretrained_config=config,
+                               attn_backend="VANILLA",
+                               max_num_tokens=32,
+                               max_seq_len=64)
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(17)
+        model_cls = MODEL_CLASS_MAPPING["DeepseekV32ForCausalLM"]
+        assert model_cls is DeepseekV3ForCausalLM
+        model = model_cls(model_config).cuda().eval()
+        assert type(model) is DeepseekV3ForCausalLM
+        assert len(model.model.layers) == 1
+        layer = model.model.layers[0]
+        assert type(layer.self_attn) is DeepseekV32Attention
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1)
+            else:
+                parameter.normal_(mean=0.0, std=0.05)
+        model.setup_aliases()
+        assert layer.next_layer_layernorm is model.model.norm
+        # Use MLA's eager path without executor-owned custom-op lookup state.
+        layer.self_attn.register_to_config = False
+
+        def make_metadata(length):
+            metadata = AttentionMetadata(
+                max_num_requests=1,
+                max_num_tokens=32,
+                mapping=model_config.mapping,
+                request_ids=[0],
+                seq_lens=torch.tensor([length], dtype=torch.int32),
+                num_contexts=1,
+            )
+            metadata.prepare()
+            return metadata
+
+        input_ids = torch.arange(32, device="cuda", dtype=torch.long)
+        position_ids = torch.arange(32, device="cuda").unsqueeze(0)
+        logits = model(attn_metadata=make_metadata(32),
+                       input_ids=input_ids,
+                       position_ids=position_ids,
+                       return_context_logits=True)
+        assert logits.shape == (32, config.vocab_size)
+        assert logits.is_cuda and logits.is_floating_point()
+        assert torch.isfinite(logits).all()
+
+        embeddings = model.model.embed_tokens(input_ids)
+        embedded_logits = model(attn_metadata=make_metadata(32),
+                                inputs_embeds=embeddings,
+                                position_ids=position_ids,
+                                return_context_logits=True)
+        torch.testing.assert_close(logits,
+                                   embedded_logits,
+                                   rtol=2e-2,
+                                   atol=2e-3)
+        prefix_logits = model(attn_metadata=make_metadata(24),
+                              input_ids=input_ids[:24],
+                              position_ids=position_ids[:, :24],
+                              return_context_logits=True)
+        torch.testing.assert_close(logits[:24],
+                                   prefix_logits,
+                                   rtol=2e-2,
+                                   atol=2e-3)
+
+        changed_ids = input_ids.clone()
+        changed_ids[0] = 33
+        changed_logits = model(attn_metadata=make_metadata(32),
+                               input_ids=changed_ids,
+                               position_ids=position_ids,
+                               return_context_logits=True)
+        assert torch.isfinite(changed_logits).all()
+        assert (logits[-1].float() -
+                changed_logits[-1].float()).abs().max() > 1e-4
+
+        normalized = embeddings.float()
+        normalized = normalized * torch.rsqrt(normalized.square().mean(
+            dim=-1, keepdim=True) + config.rms_norm_eps)
+        normalized = normalized.to(embeddings.dtype) * model.model.norm.weight
+        bypass_logits = torch.nn.functional.linear(normalized,
+                                                   model.lm_head.weight)
+        assert not torch.allclose(
+            logits.float(), bypass_logits.float(), rtol=2e-2, atol=2e-3)
+
+
 @pytest.mark.cpu_only
 def test_generation_config_mode_defaults_and_validation() -> None:
     assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
