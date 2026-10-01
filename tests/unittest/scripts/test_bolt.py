@@ -176,3 +176,49 @@ def test_repack_wheel_falls_back_for_new_members(apply_bolt, tmp_path):
     apply_bolt.repack_wheel(work, out, infos)
     with zipfile.ZipFile(out) as zf:
         assert sorted(zf.namelist()) == ["pkg/GENERATED", "pkg/lib.so"]
+
+
+@pytest.mark.cpu_only
+def test_failed_bolt_aborts_wheel_output(apply_bolt, tmp_path, monkeypatch, capsys):
+    fake_bolt = tmp_path / "llvm-bolt"
+    fake_bolt.write_text("#!/bin/sh\nexit 7\n")
+    fake_bolt.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    profile = profiles / "lib.yaml"
+    profile.write_text("profile")
+    elf = tmp_path / "lib.so"
+    elf.write_bytes(b"\x7fELF")
+    with pytest.raises(apply_bolt.BoltApplyError, match=r"lib\.so \(rc=7\)"):
+        apply_bolt.bolt_elf(elf, profile, [], strip=False, dry_run=False)
+    capsys.readouterr()
+
+    wheel = tmp_path / "input.whl"
+    _build_wheel(
+        wheel,
+        {
+            "pkg/lib.so": (elf.read_bytes(), 0o644),
+            "pkg-1.0.dist-info/RECORD": ("pkg/lib.so,,\npkg-1.0.dist-info/RECORD,,\n", 0o644),
+        },
+    )
+    original = wheel.read_bytes()
+    output = tmp_path / "output.whl"
+    monkeypatch.setattr(
+        apply_bolt.sys,
+        "argv",
+        [
+            "apply_bolt.py",
+            "--wheel",
+            str(wheel),
+            "--profiles",
+            str(profiles),
+            "--output",
+            str(output),
+        ],
+    )
+    assert apply_bolt.main() == 2
+    assert "aborting without producing an output:" in capsys.readouterr().err
+    assert not output.exists()
+    assert wheel.read_bytes() == original
