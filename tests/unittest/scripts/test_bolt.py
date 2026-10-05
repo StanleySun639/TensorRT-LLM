@@ -29,6 +29,7 @@ import importlib.util
 import stat
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,3 +177,103 @@ def test_repack_wheel_falls_back_for_new_members(apply_bolt, tmp_path):
     apply_bolt.repack_wheel(work, out, infos)
     with zipfile.ZipFile(out) as zf:
         assert sorted(zf.namelist()) == ["pkg/GENERATED", "pkg/lib.so"]
+
+
+@pytest.fixture(scope="module")
+def wheel_package():
+    spec = importlib.util.spec_from_file_location(
+        "get_wheel_from_package", REPO_ROOT / "scripts" / "get_wheel_from_package.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("branches", "profile_ref", "return_codes", "expected_branches", "error"),
+    [
+        pytest.param(
+            " release , , main , fallback ,",
+            None,
+            [3, 0],
+            ["release", "main"],
+            None,
+            id="fallback-success",
+        ),
+        pytest.param(
+            " release , , main , fallback ,",
+            None,
+            [3, 3, 3],
+            ["release", "main", "fallback"],
+            "No promoted BOLT bundle for any of ['release', 'main', 'fallback'] "
+            "(aarch64-linux-gnu); refusing to build an unoptimized release image",
+            id="all-missing",
+        ),
+        pytest.param(
+            " release ,",
+            "bundle-123",
+            [3],
+            ["release"],
+            "Pinned BOLT bundle bundle-123 (aarch64-linux-gnu) not found under "
+            "any of ['release']; refusing to build an image whose wheel is "
+            "optimized with anything else",
+            id="pinned-missing",
+        ),
+        pytest.param(
+            " release , , main , fallback ,",
+            None,
+            [7],
+            ["release"],
+            "BOLT apply failed for tensorrt_llm-test.whl (rc=7)",
+            id="apply-error",
+        ),
+    ],
+)
+def test_wheel_bolt_candidates(
+    wheel_package,
+    monkeypatch,
+    tmp_path,
+    branches,
+    profile_ref,
+    return_codes,
+    expected_branches,
+    error,
+):
+    wheel = tmp_path / "tensorrt_llm-test.whl"
+    wheel.write_bytes(b"original")
+    bolted = wheel.with_suffix(".whl.bolted")
+    monkeypatch.delenv("BOLT_PROFILE_REF", raising=False)
+    commands = []
+    codes = iter(return_codes)
+
+    def run(cmd, *, env):
+        commands.append(cmd)
+        assert env.get("BOLT_PROFILE_REF") == profile_ref
+        rc = next(codes)
+        if rc == 0:
+            Path(cmd[5]).write_bytes(b"optimized")
+        return SimpleNamespace(returncode=rc)
+
+    monkeypatch.setattr(wheel_package, "subprocess", SimpleNamespace(run=run))
+    if error is None:
+        wheel_package.bolt_optimize_wheels(tmp_path, "aarch64", branches, profile_ref)
+        assert wheel.read_bytes() == b"optimized"
+    else:
+        with pytest.raises(RuntimeError) as exc_info:
+            wheel_package.bolt_optimize_wheels(tmp_path, "aarch64", branches, profile_ref)
+        assert str(exc_info.value) == error
+        assert wheel.read_bytes() == b"original"
+
+    assert commands == [
+        [
+            "bash",
+            str(BOLT_DIR / "internal" / "apply_latest.sh"),
+            branch,
+            "aarch64-linux-gnu",
+            str(wheel),
+            str(bolted),
+        ]
+        for branch in expected_branches
+    ]
+    assert not bolted.exists()
