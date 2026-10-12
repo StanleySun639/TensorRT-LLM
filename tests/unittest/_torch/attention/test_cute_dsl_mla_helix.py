@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU correctness tests for CuTe DSL MLA's Helix output contract."""
+"""Configuration and GPU correctness tests for CuTe DSL MLA."""
 
 import math
 
@@ -11,7 +11,7 @@ import torch
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 
-pytestmark = pytest.mark.skipif(
+skip_mla_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_CUTLASS_DSL_AVAILABLE
     or get_sm_version() not in (100, 103),
@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@skip_mla_gpu
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split_kv", [1, 4])
 def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
@@ -146,3 +147,50 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
     actual_log_partition = softmax_stats[1, :, 0] + softmax_stats[1, :, 1].log()
     expected_log_partition = torch.logsumexp(scores, dim=-1)
     torch.testing.assert_close(actual_log_partition, expected_log_partition, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+def test_fp16_mla_reducer_configuration():
+    import cutlass
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import (
+        BlackwellMultiHeadLatentAttentionForwardFP16,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_helpers import MAX_SPLITS
+
+    config = dict(
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        mma_qk_tiler_mn=(128, 128),
+        mma_pv_tiler_mn=(128, 256),
+        max_active_clusters=1,
+        page_size=64,
+        skip_correction_threshold=0.0,
+        is_persistent=False,
+        is_var_seq=True,
+        is_var_split_kv=False,
+    )
+
+    kernel = BlackwellMultiHeadLatentAttentionForwardFP16(**config)
+    assert kernel.reducer_max_splits == MAX_SPLITS
+    assert kernel.reducer_d_tiles == 1
+
+    with pytest.raises(ValueError, match="reducer_max_splits must be in"):
+        BlackwellMultiHeadLatentAttentionForwardFP16.__init__(
+            kernel, **config, reducer_max_splits=0
+        )
+
+    with pytest.raises(ValueError, match="reducer_max_splits must be in"):
+        BlackwellMultiHeadLatentAttentionForwardFP16.__init__(
+            kernel, **config, reducer_max_splits=MAX_SPLITS + 1
+        )
+
+    with pytest.raises(ValueError, match="variable split-KV requires the generic reducer capacity"):
+        BlackwellMultiHeadLatentAttentionForwardFP16.__init__(
+            kernel,
+            **{**config, "is_var_split_kv": True},
+            reducer_max_splits=MAX_SPLITS - 1,
+        )
+
+    with pytest.raises(ValueError, match="unsupported reducer_d_tiles=3"):
+        BlackwellMultiHeadLatentAttentionForwardFP16.__init__(kernel, **config, reducer_d_tiles=3)
