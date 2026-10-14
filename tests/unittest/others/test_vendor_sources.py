@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path, PureWindowsPath
 from types import ModuleType
+from unittest import mock
 
 import pytest
 import yaml
@@ -213,6 +214,32 @@ def _set_patch_digest(lock: Path, content: bytes) -> None:
     lock.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
+@pytest.fixture
+def patch_dependency(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    for name in tuple(os.environ):
+        if name.startswith("GIT_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    spec = importlib.util.spec_from_file_location(
+        "_patch_dependency_under_test", _REPO_ROOT / "3rdparty" / "patch_dependency.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _dependency_patch(path: Path, relative_path: str, value: str) -> Path:
+    path.write_text(
+        f"--- a/{relative_path}\n+++ b/{relative_path}\n@@ -1 +1 @@\n-base\n+{value}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _load_vendor_sources_module() -> ModuleType:
     module_name = "_vendor_sources_under_test"
     existing = sys.modules.get(module_name)
@@ -280,6 +307,35 @@ def test_include_patterns_match_complete_paths(pattern: str, path: str, expected
     assert module._matches(path, [pattern]) is expected
 
 
+def test_dependency_apply_replaces_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_dependency: ModuleType,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_files(source, {"kernel.py": "base\n"})
+    monkeypatch.chdir(source)
+    patch_file = _dependency_patch(tmp_path / "dependency.patch", "kernel.py", "first")
+    record = source / ".trtllm-applied.patch"
+
+    patch_dependency.cmd_apply(patch_file)
+    assert (source / "kernel.py").read_bytes() == b"first\n"
+    assert record.read_bytes() == patch_file.read_bytes()
+
+    _dependency_patch(patch_file, "kernel.py", "second")
+    patch_dependency.cmd_apply(patch_file)
+    assert (source / "kernel.py").read_bytes() == b"second\n"
+    assert record.read_bytes() == patch_file.read_bytes()
+
+    before = _tree_snapshot(source)
+    with mock.patch.object(patch_dependency, "patch", wraps=patch_dependency.patch) as calls:
+        patch_dependency.cmd_apply(patch_file)
+    assert _tree_snapshot(source) == before
+    assert record.read_bytes() == patch_file.read_bytes()
+    calls.assert_called_once_with(patch_file, "--reverse", "--force", "--dry-run")
+
+
 def test_include_patterns_accept_any_matching_pattern() -> None:
     module = _load_vendor_sources_module()
     patterns = ["*.py", "sub/**/*.txt"]
@@ -290,12 +346,121 @@ def test_include_patterns_accept_any_matching_pattern() -> None:
     assert not module._matches("a.py", [])
 
 
+@pytest.mark.parametrize("previous_patch", [False, True])
+def test_dependency_apply_reports_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    patch_dependency: ModuleType,
+    previous_patch: bool,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_files(source, {"kernel.py": "local\n", "old.py": "base\n"})
+    monkeypatch.chdir(source)
+    record = source / ".trtllm-applied.patch"
+    state = "The source tree was not modified."
+    if previous_patch:
+        old_patch = _dependency_patch(tmp_path / "old.patch", "old.py", "patched")
+        patch_dependency.cmd_apply(old_patch)
+        state = "The previously applied patch has been undone, so only the local changes remain."
+    patch_file = _dependency_patch(tmp_path / "dependency.patch", "kernel.py", "new")
+
+    with pytest.raises(patch_dependency.DependencyError) as error:
+        patch_dependency.cmd_apply(patch_file)
+    diagnostic = f"local changes in {source} conflict with {patch_file.name}."
+    assert diagnostic in str(error.value)
+    assert state in str(error.value)
+    assert (source / "kernel.py").read_bytes() == b"local\n"
+    assert (source / "old.py").read_bytes() == b"base\n"
+    assert not record.exists()
+
+    monkeypatch.setattr(sys, "argv", ["patch_dependency.py", "apply", "example", str(patch_file)])
+    assert patch_dependency.main() == 1
+    stderr = capsys.readouterr().err
+    assert f"example: {diagnostic}" in stderr
+    assert "The source tree was not modified." in stderr
+    assert (source / "kernel.py").read_bytes() == b"local\n"
+    assert not record.exists()
+
+
 def test_include_patterns_use_posix_normalized_windows_paths() -> None:
     module = _load_vendor_sources_module()
     relative = PureWindowsPath(r"sub\deep\a.py").as_posix()
     assert module._matches(relative, ["sub/**/*.py"])
     assert not module._matches(relative, ["sub/*.py"])
     assert not module._matches(relative, ["Sub/**/*.py"])
+
+
+@pytest.mark.parametrize("modules_state", ["absent", "empty", "populated"])
+def test_dependency_update_preserves_local_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_dependency: ModuleType,
+    modules_state: str,
+) -> None:
+    repo, first = _make_upstream(tmp_path, {"kernel.py": "base\n", "other.py": "base\n"})
+    _write_files(repo / _SOURCE, {"version.py": "target\n"})
+    target = _commit(repo, "new pin")
+    _git(repo, "checkout", "-b", "pinned", first)
+    monkeypatch.chdir(repo)
+    patch_file = _dependency_patch(tmp_path / "dependency.patch", f"{_SOURCE}/kernel.py", "patched")
+    record = Path(_git(repo, "rev-parse", "--absolute-git-dir")) / "trtllm-applied.patch"
+    modules = record.parent / "modules"
+    if modules_state != "absent":
+        modules.mkdir()
+    if modules_state == "populated":
+        (modules / "unused").mkdir()
+    patch_dependency.cmd_apply(patch_file)
+
+    with mock.patch.object(patch_dependency, "git", wraps=patch_dependency.git) as calls:
+        patch_dependency.cmd_update("example", first)
+    commands = [call.args[0] for call in calls.call_args_list]
+    assert "checkout" not in commands
+    assert "submodule" not in commands
+    assert _git(repo, "rev-parse", "HEAD") == first
+    assert _git(repo, "symbolic-ref", "HEAD") == "refs/heads/pinned"
+    assert (repo / _SOURCE / "kernel.py").read_bytes() == b"patched\n"
+    assert record.read_bytes() == patch_file.read_bytes()
+
+    dirty_file = repo / _SOURCE / "other.py"
+    dirty_file.write_text("local\n", encoding="utf-8")
+    previous_short = _git(repo, "rev-parse", "--short", "HEAD")
+    with mock.patch.object(patch_dependency, "git", wraps=patch_dependency.git) as calls:
+        with pytest.raises(patch_dependency.DependencyError) as error:
+            patch_dependency.cmd_update("example", target)
+    assert f"local changes in {repo} prevent checking out {target}." in str(error.value)
+    assert "The previously applied patch has been undone" in str(error.value)
+    assert f"It is still at the previous commit {previous_short}." in str(error.value)
+    calls.assert_any_call("status", "--porcelain", "--ignore-submodules=dirty")
+    commands = [call.args[0] for call in calls.call_args_list]
+    assert "checkout" not in commands
+    assert "submodule" not in commands
+    assert _git(repo, "rev-parse", "HEAD") == first
+    assert _git(repo, "symbolic-ref", "HEAD") == "refs/heads/pinned"
+    assert dirty_file.read_bytes() == b"local\n"
+    assert (repo / _SOURCE / "kernel.py").read_bytes() == b"base\n"
+    assert not record.exists()
+
+    dirty_file.write_text("base\n", encoding="utf-8")
+    patch_dependency.cmd_apply(patch_file)
+    with mock.patch.object(patch_dependency, "git", wraps=patch_dependency.git) as calls:
+        patch_dependency.cmd_update("example", target)
+    calls.assert_any_call("checkout", "--quiet", "--detach", target)
+    assert _git(repo, "rev-parse", "HEAD") == target
+    detached = _run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=repo, check=False)
+    assert detached.returncode == 1
+    assert (repo / _SOURCE / "kernel.py").read_bytes() == b"base\n"
+    assert (repo / _SOURCE / "version.py").read_bytes() == b"target\n"
+    assert not record.exists()
+    assert _git(repo, "status", "--porcelain", "--ignore-submodules=dirty") == ""
+    submodule_calls = [call for call in calls.call_args_list if call.args[0] == "submodule"]
+    expected = (
+        [mock.call("submodule", "update", "--quiet", "--init", "--recursive")]
+        if modules_state == "populated"
+        else []
+    )
+    assert submodule_calls == expected
 
 
 def test_current_level_include_preserves_unselected_files_on_sync(tmp_path: Path) -> None:
@@ -333,6 +498,26 @@ def test_current_level_include_preserves_unselected_files_on_sync(tmp_path: Path
     assert (destination / "sub/a.py").read_text(encoding="utf-8") == "local nested file\n"
     assert (destination / "README.md").read_text(encoding="utf-8") == "local docs\n"
     _vendor(consumer, lock, "check", _VENDOR_NAME)
+
+
+def test_dependency_record_uses_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_dependency: ModuleType,
+) -> None:
+    repo, _ = _make_upstream(tmp_path, {"kernel.py": "base\n"})
+    source = repo / "build" / "dependency"
+    source.mkdir(parents=True)
+    monkeypatch.chdir(source)
+    assert patch_dependency.record_path() == source / ".trtllm-applied.patch"
+    assert patch_dependency.record_path(require_git=True) is None
+
+    monkeypatch.chdir(repo)
+    git_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir"))
+    assert git_dir.is_absolute()
+    expected = git_dir / "trtllm-applied.patch"
+    assert patch_dependency.record_path() == expected
+    assert patch_dependency.record_path(require_git=True) == expected
 
 
 def test_atomic_write_syncs_file_before_replacement(
