@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for MiniCPM-V 4.6 config loading on the PyTorch backend.
+"""Unit tests for MiniCPM-V 4.6 configuration and forward execution.
 
-These tests are intentionally CPU-only and do not require model weights or a
-native ``minicpmv4_6`` transformers release, so they run (and protect the fix)
-on the repo's currently-pinned ``transformers==5.5.4`` CI as well as on
+The configuration tests do not require CUDA, model weights, or a native
+``minicpmv4_6`` transformers release. They run on the repo's currently-pinned
+``transformers==5.5.4`` CI as well as on
 ``>=5.7.0``:
 
 * ``_resolve_composite_torch_dtype`` dtype resolution.
@@ -29,6 +29,8 @@ on the repo's currently-pinned ``transformers==5.5.4`` CI as well as on
 
 A single ``transformers>=5.7.0``-gated test asserts the native config is present
 once the pin is bumped (at which point the local shim can be removed).
+
+The small construction and forward test requires CUDA but no checkpoint.
 """
 
 import copy
@@ -264,3 +266,143 @@ def test_native_minicpmv4_6_config_available():
     from transformers import MiniCPMV4_6Config as HFMiniCPMV4_6Config
 
     assert HFMiniCPMV4_6Config.model_type == "minicpmv4_6"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The production model requires CUDA")
+@torch.inference_mode()
+def test_minicpmv4_6_construction_and_forward():
+    from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6Model
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextFullAttentionDecoderLayer
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.modules.layer_norm import LayerNorm
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+    torch.manual_seed(0)
+    raw = _minicpmv4_6_config_dict()
+    raw.update(
+        torch_dtype="float32",
+        image_size=8,
+        insert_layer_id=0,
+        image_token_id=63,
+        video_token_id=62,
+    )
+    raw["vision_config"].update(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        image_size=8,
+        patch_size=2,
+    )
+    # Full attention needs no recurrent-state cache or Hopper-only GDN kernel.
+    raw["text_config"].update(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        full_attention_interval=1,
+        layer_types=["full_attention"],
+        max_position_embeddings=32,
+        vocab_size=64,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    config = _build_minicpmv4_6_config(raw)
+    model_cls = get_registered_model_class("MiniCPMV4_6ForConditionalGeneration")
+    assert model_cls is MiniCPMV4_6Model
+    model = (
+        model_cls(ModelConfig(pretrained_config=config, attn_backend="VANILLA", max_num_tokens=16))
+        .cuda()
+        .eval()
+    )
+    assert isinstance(model, MiniCPMV4_6Model)
+    assert len(model.mm_encoder.encoder.layers) == 1
+    assert len(model.llm.model.layers) == 1
+    assert isinstance(model.llm.model.layers[0], Qwen3NextFullAttentionDecoderLayer)
+
+    for parameter in model.parameters():
+        parameter.uniform_(-0.1, 0.1)
+    for module in model.modules():
+        if isinstance(module, LayerNorm):
+            module.weight.fill_(1.0)
+            module.bias.zero_()
+        elif isinstance(module, RMSNorm):
+            module.weight.zero_()
+    model.llm.post_load_weights()
+
+    metadata = VanillaAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=4,
+        kv_cache_manager=None,
+        kv_cache_params=KVCacheParams(use_cache=False),
+    )
+    metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
+    metadata.num_contexts = 1
+    metadata.request_ids = [0]
+    metadata.prompt_lens = [4]
+    metadata.prepare()
+    # Qwen3NextModel reads this even when every layer is full attention.
+    metadata.mamba_metadata = Mamba2Metadata(max_batch_size=1, chunk_size=128)
+
+    input_ids = torch.tensor([3, 65, 7, 11], dtype=torch.int32, device="cuda")
+    position_ids = torch.arange(4, dtype=torch.int32, device="cuda")
+    pixels = torch.randn(1, 3, 2, 32, device="cuda")
+    target_sizes = torch.tensor([[4, 4]], dtype=torch.int32)
+    image = MultimodalParams(
+        multimodal_data={"image": {"pixel_values": pixels, "target_sizes": target_sizes}}
+    )
+    features = model.mm_encoder([image])[0]
+    assert features.shape == (1, 128)
+    cached_image = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": -pixels, "target_sizes": target_sizes},
+            "multimodal_embedding": features.clone(),
+        }
+    )
+    changed_image = MultimodalParams(
+        multimodal_data={"image": {"pixel_values": -pixels, "target_sizes": target_sizes}}
+    )
+
+    logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        multimodal_params=[image],
+        return_context_logits=True,
+    )
+    cached_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        multimodal_params=[cached_image],
+        return_context_logits=True,
+    )
+    changed_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        multimodal_params=[changed_image],
+        return_context_logits=True,
+    )
+    for output in (logits, cached_logits, changed_logits):
+        assert output.shape == (4, 64)
+        assert output.dtype == torch.float32
+        assert torch.isfinite(output).all()
+    torch.testing.assert_close(logits, cached_logits, rtol=2e-4, atol=2e-5)
+    assert not torch.allclose(logits, changed_logits, rtol=2e-4, atol=2e-5)
+
+    safe_ids = torch.tensor([3, 0, 7, 11], dtype=torch.int32, device="cuda")
+    fused = model.llm.model.embed_tokens(safe_ids)
+    fused[1:2] = features
+    bypass_logits = model.llm.lm_head(fused).float()
+    normalized_bypass_logits = model.llm.lm_head(model.llm.model.norm(fused)).float()
+    assert not torch.allclose(logits, bypass_logits, rtol=2e-4, atol=2e-5)
+    assert not torch.allclose(logits, normalized_bypass_logits, rtol=2e-4, atol=2e-5)
