@@ -3,13 +3,125 @@
 
 import pytest
 import torch
+from transformers import Qwen2Config
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen2vl
+from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForProcessRewardModel, QwenDecoderLayer
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel,
     Qwen2_5_VLVisionAttention,
 )
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_qwen2_process_reward_token_scores(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    config = Qwen2Config(
+        architectures=["Qwen2ForProcessRewardModel"],
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        rope_scaling=None,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+    )
+    assert get_registered_model_class("Qwen2ForProcessRewardModel") is Qwen2ForProcessRewardModel
+
+    def initialize_weights(model):
+        for name, parameter in model.named_parameters():
+            if name.endswith("norm.weight"):
+                parameter.fill_(1)
+            else:
+                parameter.normal_(mean=0, std=0.1)
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        model = (
+            Qwen2ForProcessRewardModel(
+                ModelConfig(
+                    pretrained_config=config,
+                    attn_backend="TRTLLM",
+                    max_seq_len=32,
+                    max_num_tokens=7,
+                )
+            )
+            .cuda()
+            .eval()
+        )
+        initialize_weights(model)
+
+    assert isinstance(model, Qwen2ForProcessRewardModel)
+    assert len(model.model.layers) == 1
+    assert isinstance(model.model.layers[0], QwenDecoderLayer)
+    assert model.num_labels == 2
+
+    def prepare_inputs(sequences):
+        lengths = [sequence.numel() for sequence in sequences]
+        position_ids = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=len(sequences),
+            max_num_tokens=sum(lengths),
+            num_contexts=len(sequences),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            request_ids=list(range(len(sequences))),
+            position_ids=position_ids,
+        )
+        metadata.max_seq_len = 32
+        metadata.prepare()
+        return dict(
+            attn_metadata=metadata,
+            input_ids=torch.cat(sequences),
+            position_ids=position_ids,
+        )
+
+    first_sequence = torch.tensor([1, 7, 11, 13], device="cuda")
+    second_sequence = torch.tensor([1, 17, 19], device="cuda")
+    output = model(**prepare_inputs([first_sequence, second_sequence]))
+    assert output.is_nested
+    assert output.size(0) == 2
+    first_score = output[0]
+    second_score = output[1]
+    assert first_score.shape == (4, 2)
+    assert second_score.shape == (3, 2)
+    assert first_score.dtype == torch.bfloat16
+    assert second_score.dtype == torch.bfloat16
+    assert first_score.is_cuda
+    assert second_score.is_cuda
+    assert torch.isfinite(first_score).all()
+    assert torch.isfinite(second_score).all()
+
+    first_single_output = model(**prepare_inputs([first_sequence]))
+    second_single_output = model(**prepare_inputs([second_sequence]))
+    torch.testing.assert_close(first_score, first_single_output[0], atol=1e-2, rtol=2e-3)
+    torch.testing.assert_close(second_score, second_single_output[0], atol=1e-2, rtol=2e-3)
+
+    # Batch agreement alone would also accept a decoder that did nothing.
+    first_embeddings = model.model.embed_tokens(first_sequence)
+    second_embeddings = model.model.embed_tokens(second_sequence)
+    first_bypassed_score = model.score(model.model.norm(first_embeddings))
+    second_bypassed_score = model.score(model.model.norm(second_embeddings))
+    assert not torch.allclose(first_score, first_bypassed_score, atol=1e-2, rtol=2e-3)
+    assert not torch.allclose(second_score, second_bypassed_score, atol=1e-2, rtol=2e-3)
+
+    changed_output = model(
+        **prepare_inputs([torch.tensor([23, 29, 31, 13], device="cuda"), second_sequence])
+    )
+    changed_first_score = changed_output[0]
+    changed_second_score = changed_output[1]
+    assert not torch.allclose(first_score[-1], changed_first_score[-1], atol=1e-2, rtol=2e-3)
+    torch.testing.assert_close(second_score, changed_second_score, atol=1e-2, rtol=2e-3)
 
 
 @pytest.mark.cpu_only
