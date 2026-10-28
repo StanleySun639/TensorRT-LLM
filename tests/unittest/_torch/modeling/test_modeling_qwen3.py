@@ -15,12 +15,15 @@
 
 import pytest
 import torch
-from transformers import Qwen3Config
+from transformers import Qwen3Config, Qwen3MoeConfig
 from transformers import Qwen3ForCausalLM as HFQwen3ForCausalLM
+from transformers import Qwen3MoeForCausalLM as HFQwen3MoeForCausalLM
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen3_moe import Qwen3MoEDecoderLayer, Qwen3MoeForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 
 
@@ -68,6 +71,88 @@ def test_qwen3_for_causal_lm_forward():
     assert isinstance(model, Qwen3ForCausalLM)
     assert len(model.model.layers) == 2
     assert all(isinstance(layer, Qwen3DecoderLayer) for layer in model.model.layers)
+
+    input_ids = torch.tensor([[1, 7, 11, 13], [1, 17, 19, 23]], device="cuda", dtype=torch.long)
+    position_ids = torch.arange(4, device="cuda").repeat(2)
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=2,
+        max_num_tokens=8,
+        num_contexts=2,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        request_ids=[0, 1],
+        position_ids=position_ids,
+    )
+    metadata.max_seq_len = 32
+    metadata.prepare()
+
+    actual_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids.flatten(),
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    reference_logits = reference(input_ids=input_ids, use_cache=False).logits.reshape(8, 64)
+
+    assert actual_logits.shape == (8, 64)
+    assert actual_logits.dtype == torch.float32
+    assert torch.isfinite(actual_logits).all()
+    torch.testing.assert_close(actual_logits, reference_logits.float(), atol=1e-2, rtol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_qwen3_moe_for_causal_lm_forward():
+    config = Qwen3MoeConfig(
+        architectures=["Qwen3MoeForCausalLM"],
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        max_position_embeddings=32,
+        rope_scaling=None,
+        attention_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+    )
+    model_class = get_registered_model_class("Qwen3MoeForCausalLM")
+    assert model_class is Qwen3MoeForCausalLM
+
+    model_config = ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        moe_backend="CUTLASS",
+        moe_disable_finalize_fusion=True,
+        max_seq_len=32,
+        max_num_tokens=8,
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        reference = HFQwen3MoeForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
+        model = model_class(model_config).cuda().eval()
+        weight_mapper = Qwen3MoeHfWeightMapper()
+        weight_mapper.init_model_and_config(model, model_config)
+        model.load_weights(reference.state_dict(), weight_mapper)
+        for module in model.modules():
+            if hasattr(module, "post_load_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.post_load_weights()
+
+    assert isinstance(model, Qwen3MoeForCausalLM)
+    assert len(model.model.layers) == 1
+    assert isinstance(model.model.layers[0], Qwen3MoEDecoderLayer)
 
     input_ids = torch.tensor([[1, 7, 11, 13], [1, 17, 19, 23]], device="cuda", dtype=torch.long)
     position_ids = torch.arange(4, device="cuda").repeat(2)
