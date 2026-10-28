@@ -47,9 +47,6 @@ from parameterized import parameterized
 from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
-pytestmark = pytest.mark.cpu_only
-
-
 # Resolve the Step3p7 checkpoints under the shared model root (LLM_MODELS_ROOT)
 # like the other modeling tests instead of hard-coding a developer workspace
 # path. The FP8 block-scale, NVFP4, and BF16 reference checkpoints share the
@@ -84,6 +81,122 @@ def _load_safetensors_keys(checkpoint_dir: str) -> list:
     return all_keys
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="attention dispatch requires a GPU")
+@torch.inference_mode()
+def test_registered_wrapper_text_forward_matches_reference():
+    import torch.nn.functional as F
+
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7DecoderLayer
+    from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VLForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm.mapping import Mapping
+
+    dtype = torch.bfloat16
+    config = PretrainedConfig(
+        architectures=["Step3p7ForConditionalGeneration"],
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_attention_groups=1,
+        num_key_value_heads=1,
+        head_dim=64,
+        vocab_size=32,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        use_head_wise_attn_gate=True,
+        moe_layers_enum=[],
+        num_nextn_predict_layers=0,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        image_token_id=3,
+        torch_dtype=dtype,
+    )
+    model_cls = get_registered_model_class("Step3p7ForConditionalGeneration")
+    assert model_cls is Step3p7VLForConditionalGeneration
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(41)
+        model = (
+            model_cls(
+                ModelConfig(
+                    pretrained_config=config,
+                    mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                    attn_backend="TRTLLM",
+                    max_num_tokens=2,
+                    max_seq_len=16,
+                )
+            )
+            .cuda()
+            .eval()
+        )
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.05)
+        assert isinstance(model, Step3p7VLForConditionalGeneration)
+        assert len(model.llm.model.layers) == 1
+        layer = model.llm.model.layers[0]
+        assert isinstance(layer, Step3p7DecoderLayer)
+
+        input_ids = torch.tensor([4, 7], device="cuda", dtype=torch.long)
+        metadata = get_attention_backend("TRTLLM").Metadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            kv_cache_manager=None,
+        )
+        metadata.num_contexts = 2
+        metadata.request_ids = [1, 2]
+        metadata.prompt_lens = [1, 1]
+        metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int)
+        metadata.max_seq_len = 1
+        metadata.prepare()
+        logits = model(
+            attn_metadata=metadata,
+            input_ids=input_ids,
+            position_ids=torch.zeros_like(input_ids),
+            return_context_logits=True,
+        )
+        assert logits.shape == (2, config.vocab_size)
+        assert logits.dtype == torch.float32
+        assert torch.isfinite(logits).all()
+
+        def norm(x, weight):
+            x = x.float()
+            return (
+                x
+                * torch.rsqrt(x.square().mean(-1, keepdim=True) + config.rms_norm_eps)
+                * (1 + weight.float())
+            ).to(dtype)
+
+        embeddings = F.embedding(input_ids, model.llm.model.embed_tokens.weight)
+        hidden = norm(embeddings, layer.input_layernorm.weight)
+        attn = layer.self_attn
+        # Each request has one token: softmax is exactly one, independently
+        # of Q/K normalization and RoPE, so the attention result is V.
+        value = F.linear(hidden, attn.qkv_proj.weight).chunk(3, dim=-1)[2]
+        gate = F.linear(hidden, attn.g_proj.weight).sigmoid()
+        attention_output = F.linear(value * gate, attn.o_proj.weight)
+        residual = (embeddings + attention_output).to(dtype)
+        hidden = norm(residual, layer.post_attention_layernorm.weight)
+        gate, up = F.linear(hidden, layer.mlp.gate_up_proj.weight).chunk(2, dim=-1)
+        hidden = (F.silu(gate.float()) * up.float()).to(dtype)
+        hidden = F.linear(hidden, layer.mlp.down_proj.weight)
+        hidden = (hidden + residual).to(dtype)
+        expected = F.linear(
+            norm(hidden, model.llm.model.norm.weight), model.llm.lm_head.weight
+        ).float()
+        torch.testing.assert_close(logits, expected, atol=2e-2, rtol=2e-2)
+
+        bypassed = F.linear(
+            norm(embeddings, model.llm.model.norm.weight), model.llm.lm_head.weight
+        ).float()
+        assert not torch.allclose(logits, bypassed, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cpu_only
 class TestStep3p7Helpers(unittest.TestCase):
     """Pure-Python loader/helper tests — no checkpoint and no GPU required."""
 
@@ -609,6 +722,7 @@ class TestStep3p7Helpers(unittest.TestCase):
             rms_norm_module.IS_FLASHINFER_AVAILABLE = flashinfer_available
 
 
+@pytest.mark.cpu_only
 class TestStep3p7AutoModelRegistration(unittest.TestCase):
     """Verify the Step3p7 architectures resolve to the expected model classes."""
 
@@ -626,6 +740,7 @@ class TestStep3p7AutoModelRegistration(unittest.TestCase):
         self.assertIs(MODEL_CLASS_MAPPING.get("Step3p5ForCausalLM"), Step3p7ForCausalLM)
 
 
+@pytest.mark.cpu_only
 class TestStep3p7Checkpoint(unittest.TestCase):
     """Config / weight-accounting tests against the real Step-3.7-Flash checkpoints.
 
