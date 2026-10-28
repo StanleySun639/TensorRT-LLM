@@ -3,13 +3,145 @@
 
 import pytest
 import torch
+from transformers import Qwen2Config
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen2vl
+from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForRewardModel, QwenDecoderLayer
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel,
     Qwen2_5_VLVisionAttention,
 )
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_qwen2_reward_model_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    config = Qwen2Config(
+        architectures=["Qwen2ForRewardModel"],
+        vocab_size=32,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=16,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        torch_dtype=torch.float16,
+    )
+    model_class = get_registered_model_class("Qwen2ForRewardModel")
+    assert model_class is Qwen2ForRewardModel
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        model = (
+            model_class(
+                ModelConfig(
+                    pretrained_config=config,
+                    attn_backend="TRTLLM",
+                    max_seq_len=16,
+                    max_num_tokens=5,
+                )
+            )
+            .cuda()
+            .eval()
+        )
+        for name, parameter in model.named_parameters():
+            if name.endswith("bias"):
+                parameter.zero_()
+            elif parameter.ndim == 1:
+                parameter.fill_(1)
+            else:
+                parameter.normal_(mean=0, std=0.1)
+
+    assert isinstance(model, Qwen2ForRewardModel)
+    assert len(model.model.layers) == 1
+    layer = model.model.layers[0]
+    assert isinstance(layer, QwenDecoderLayer)
+    assert model.num_labels == 1
+    assert model.score[2].out_features == 1
+
+    decoder_outputs = []
+    transformations = []
+
+    def capture_decoder(module, args, output):
+        decoder_outputs.append(output.clone())
+
+    def capture_transform(module, args, kwargs, output):
+        inputs = kwargs["hidden_states"] if module is layer.self_attn else args[0]
+        transformations.append((inputs.clone(), output.clone()))
+
+    def make_inputs(sequences):
+        lengths = [len(sequence) for sequence in sequences]
+        input_ids = torch.tensor(
+            [token for sequence in sequences for token in sequence],
+            device="cuda",
+            dtype=torch.long,
+        )
+        position_ids = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=len(sequences),
+            max_num_tokens=sum(lengths),
+            num_contexts=len(sequences),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            request_ids=list(range(len(sequences))),
+            position_ids=position_ids,
+        )
+        metadata.max_seq_len = 16
+        metadata.prepare()
+        return {
+            "attn_metadata": metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+
+    def reference_score(hidden_states):
+        projected = torch.nn.functional.linear(
+            hidden_states, model.score[0].weight, model.score[0].bias
+        )
+        return torch.nn.functional.linear(
+            torch.relu(projected), model.score[2].weight, model.score[2].bias
+        )
+
+    handles = [
+        model.model.register_forward_hook(capture_decoder),
+        layer.self_attn.register_forward_hook(capture_transform, with_kwargs=True),
+        layer.mlp.register_forward_hook(capture_transform, with_kwargs=True),
+    ]
+    sequences = [[3, 7], [11, 13, 7]]
+    try:
+        actual = model(**make_inputs(sequences))
+        individual = torch.cat([model(**make_inputs([sequence])) for sequence in sequences])
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert actual.shape == (2, 1)
+    assert actual.dtype == torch.float16
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, individual, atol=1e-2, rtol=2e-3)
+
+    assert len(decoder_outputs) == 3
+    expected = reference_score(decoder_outputs[0])[[1, 4]]
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-3)
+
+    embeddings = model.model.embed_tokens(
+        torch.tensor([3, 7, 11, 13, 7], device="cuda", dtype=torch.long)
+    )
+    bypassed = reference_score(model.model.norm(embeddings))[[1, 4]]
+    assert not torch.allclose(actual, bypassed, atol=1e-2, rtol=2e-3)
+
+    assert len(transformations) == 6
+    for inputs, outputs in transformations:
+        assert inputs.shape == outputs.shape
+        assert torch.isfinite(outputs).all()
+        assert not torch.allclose(inputs, outputs, atol=1e-2, rtol=2e-3)
 
 
 @pytest.mark.cpu_only
