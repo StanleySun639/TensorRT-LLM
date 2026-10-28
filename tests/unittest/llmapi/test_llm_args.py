@@ -79,6 +79,123 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from .test_llm import llama_model_path
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_qwen3_next_for_causal_lm_forward():
+    from transformers import Qwen3NextConfig
+
+    from tensorrt_llm._torch.attention.backends.trtllm import \
+        TrtllmAttentionMetadata
+    from tensorrt_llm._torch.models.modeling_qwen3_next import (
+        Qwen3NextForCausalLM, Qwen3NextFullAttentionDecoderLayer,
+        _DenseMlpAdapter)
+    from tensorrt_llm._torch.models.modeling_utils import \
+        get_registered_model_class
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
+    config = Qwen3NextConfig(
+        architectures=["Qwen3NextForCausalLM"],
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        num_experts=0,
+        num_experts_per_tok=1,
+        max_position_embeddings=32,
+        rope_scaling=None,
+        attention_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+    )
+    model_class = get_registered_model_class("Qwen3NextForCausalLM")
+    assert model_class is Qwen3NextForCausalLM
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        model = model_class(
+            ModelConfig(
+                pretrained_config=config,
+                attn_backend="TRTLLM",
+                max_seq_len=32,
+                max_num_tokens=8,
+            )).cuda().eval()
+        for parameter in model.parameters():
+            parameter.normal_(mean=0.0, std=0.02)
+    model.setup_aliases()
+
+    assert isinstance(model, Qwen3NextForCausalLM)
+    assert len(model.model.layers) == 1
+    layer = model.model.layers[0]
+    assert isinstance(layer, Qwen3NextFullAttentionDecoderLayer)
+    assert layer.self_attn.attn_output_gate
+    assert layer.input_layernorm.use_gemma
+    assert isinstance(layer.mlp, _DenseMlpAdapter)
+    assert layer.next_layer_layernorm is model.model.norm
+
+    input_ids = torch.tensor([[1, 7, 11, 13], [17, 19, 23, 13]],
+                             device="cuda",
+                             dtype=torch.long)
+    position_ids = torch.arange(4, device="cuda").repeat(2)
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=2,
+        max_num_tokens=8,
+        num_contexts=2,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        request_ids=[0, 1],
+        position_ids=position_ids,
+    )
+    metadata.max_seq_len = 32
+    metadata.prepare()
+    # The backbone reads batch capacity even with no recurrent layers.
+    metadata.mamba_metadata = Mamba2Metadata(2, chunk_size=128)
+
+    embeddings = model.model.embed_tokens(input_ids.flatten())
+    context_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids.flatten(),
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    embedding_logits = model(
+        attn_metadata=metadata,
+        input_ids=None,
+        inputs_embeds=embeddings.clone(),
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    last_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids.flatten(),
+        position_ids=position_ids,
+        return_context_logits=False,
+    )
+
+    assert context_logits.shape == (8, 64)
+    assert context_logits.dtype == torch.float32
+    assert torch.isfinite(context_logits).all()
+    torch.testing.assert_close(embedding_logits,
+                               context_logits,
+                               atol=1e-2,
+                               rtol=2e-3)
+    torch.testing.assert_close(last_logits,
+                               context_logits[[3, 7]],
+                               atol=1e-2,
+                               rtol=2e-3)
+    assert not torch.allclose(
+        context_logits[3], context_logits[7], atol=1e-3, rtol=2e-3)
+    for hidden_states in (embeddings, model.model.norm(embeddings.clone())):
+        bypass_logits = model.lm_head(hidden_states).float()
+        assert not torch.allclose(
+            context_logits, bypass_logits, atol=1e-2, rtol=2e-3)
+
+
 @pytest.mark.cpu_only
 def test_generation_config_mode_defaults_and_validation() -> None:
     assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
