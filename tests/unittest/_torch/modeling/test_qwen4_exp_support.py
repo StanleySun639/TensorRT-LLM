@@ -228,6 +228,97 @@ def test_text_model_registration_and_defaults() -> None:
     assert Qwen4ExpForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Model forward requires CUDA")
+@torch.inference_mode()
+def test_text_model_context_forward() -> None:
+    from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpForCausalLM
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm.mapping import Mapping
+
+    fields = _text_config_dict()
+    fields.update(
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        ple_layer_ids=[],
+        vocab_size=64,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        max_position_embeddings=32,
+    )
+    config = Qwen4ExpTextConfig.from_dict(fields)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        attn_backend="TRTLLM",
+        moe_backend="CUTLASS",
+        max_num_tokens=3,
+        moe_disable_finalize_fusion=True,
+    )
+    model_class = get_registered_model_class("Qwen4ExpForCausalLM")
+    assert model_class is Qwen4ExpForCausalLM
+    with torch.device("cuda"):
+        model = model_class(model_config).eval()
+    generator = torch.Generator(device="cuda").manual_seed(163)
+    for parameter in model.parameters():
+        parameter.uniform_(-0.1, 0.1, generator=generator)
+
+    input_ids = torch.tensor([3, 5, 7], device="cuda", dtype=torch.long)
+    other_ids = torch.tensor([11, 13, 7], device="cuda", dtype=torch.long)
+    position_ids = torch.arange(3, device="cuda", dtype=torch.long)
+
+    def metadata():
+        result = TrtllmAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=3,
+            mapping=model_config.mapping,
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            num_contexts=1,
+            request_ids=[0],
+        )
+        result.max_seq_len = 3
+        result.prepare()
+        return result
+
+    logits = model(
+        attn_metadata=metadata(),
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    embeddings = model.model.embed_tokens(input_ids)
+    embedded_logits = model(
+        attn_metadata=metadata(),
+        inputs_embeds=embeddings,
+        orig_input_ids=other_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    other_logits = model(
+        attn_metadata=metadata(),
+        input_ids=other_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    for output in (logits, embedded_logits, other_logits):
+        assert output.shape == (3, config.vocab_size)
+        assert output.dtype == torch.float32
+        assert output.is_cuda
+        assert torch.isfinite(output).all()
+    torch.testing.assert_close(logits, embedded_logits, atol=1e-3, rtol=1e-2)
+    assert not torch.allclose(logits[-1], other_logits[-1], atol=1e-4, rtol=1e-3)
+
+    # Keep the final mixer and head, but compute this baseline without the decoder.
+    embedding_bundle = torch.cat([embeddings] * config.hc_count, dim=-1)
+    bypassed_logits = model.logits_processor(
+        embedding_bundle, model.lm_head, None, return_context_logits=True
+    )
+    assert not torch.allclose(logits, bypassed_logits, atol=1e-4, rtol=1e-3)
+
+
 def test_empty_architecture_list_is_not_qwen4_exp() -> None:
     from tensorrt_llm._torch.pyexecutor.config_utils import is_qwen4_exp
 
