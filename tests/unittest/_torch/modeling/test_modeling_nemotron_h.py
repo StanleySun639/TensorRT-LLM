@@ -3,16 +3,121 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
+from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 from utils.util import (skip_fp8_pre_ada, skip_gpu_memory_less_than,
                         skip_single_gpu)
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, LoadFormat,
                                           PrefillCudaGraphBackend)
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+@torch.inference_mode()
+def test_nemotron_h_forward_reference(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    config = PretrainedConfig(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="*-",
+        num_hidden_layers=2,
+        hidden_size=256,
+        intermediate_size=512,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        max_position_embeddings=16,
+        vocab_size=128,
+        torch_dtype=torch.float16,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        tie_word_embeddings=False,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    model_cls = get_registered_model_class("NemotronHForCausalLM")
+    assert model_cls is NemotronHForCausalLM
+    model_config = ModelConfig(pretrained_config=config,
+                               attn_backend="TRTLLM",
+                               max_num_tokens=4,
+                               max_seq_len=16)
+    model = model_cls(model_config).cuda().eval()
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for parameter in model.parameters():
+        if parameter.ndim == 1:
+            parameter.fill_(1.0)
+        else:
+            parameter.normal_(mean=0.0, std=0.02, generator=generator)
+    model.post_load_weights()
+
+    input_ids = torch.tensor([3, 5, 7, 11], dtype=torch.int, device="cuda")
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=input_ids.numel(),
+        num_contexts=1,
+        seq_lens=torch.tensor([input_ids.numel()], dtype=torch.int),
+        request_ids=[0],
+    )
+    metadata.max_seq_len = config.max_position_embeddings
+    metadata.prepare()
+
+    def rms_norm(x, weight):
+        return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) +
+                               config.rms_norm_eps) * weight.float()
+
+    # Compute the reference independently of the native layers and FMHA.
+    attention_layer, mlp_layer = model.model.layers
+    attention = attention_layer.mixer
+    hidden = F.embedding(input_ids.long(),
+                         model.model.embed_tokens.weight.float())
+    normalized = rms_norm(hidden, attention_layer.norm.weight)
+    qkv = F.linear(normalized, attention.qkv_proj.weight.float())
+    q_size = config.num_attention_heads * config.head_dim
+    kv_size = config.num_key_value_heads * config.head_dim
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    q = q.reshape(-1, config.num_attention_heads,
+                  config.head_dim).transpose(0, 1)
+    k = k.reshape(-1, config.num_key_value_heads,
+                  config.head_dim).transpose(0, 1)
+    v = v.reshape(-1, config.num_key_value_heads,
+                  config.head_dim).transpose(0, 1)
+    groups = config.num_attention_heads // config.num_key_value_heads
+    k = k.repeat_interleave(groups, dim=0)
+    v = v.repeat_interleave(groups, dim=0)
+    scores = q @ k.transpose(-1, -2) / config.head_dim**0.5
+    future = torch.ones(input_ids.numel(),
+                        input_ids.numel(),
+                        dtype=torch.bool,
+                        device="cuda").triu(1)
+    probabilities = scores.masked_fill(future, float("-inf")).softmax(-1)
+    attended = (probabilities @ v).transpose(0, 1).reshape(-1, q_size)
+    hidden = hidden + F.linear(attended, attention.o_proj.weight.float())
+    normalized = rms_norm(hidden, mlp_layer.norm.weight)
+    up = F.linear(normalized, mlp_layer.mixer.up_proj.weight.float())
+    hidden = hidden + F.linear(up.relu().square(),
+                               mlp_layer.mixer.down_proj.weight.float())
+    expected = F.linear(rms_norm(hidden, model.model.norm_f.weight),
+                        model.lm_head.weight.float())
+
+    context_logits = model(attn_metadata=metadata,
+                           input_ids=input_ids,
+                           return_context_logits=True)
+    assert context_logits.shape == (input_ids.numel(), config.vocab_size)
+    assert context_logits.dtype == torch.float32
+    assert torch.isfinite(context_logits).all()
+    torch.testing.assert_close(context_logits, expected, atol=5e-3, rtol=5e-3)
+
+    last_logits = model(attn_metadata=metadata, input_ids=input_ids)
+    assert last_logits.shape == (1, config.vocab_size)
+    torch.testing.assert_close(last_logits, expected[-1:], atol=5e-3, rtol=5e-3)
 
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
