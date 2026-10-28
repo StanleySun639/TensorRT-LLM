@@ -79,6 +79,97 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from .test_llm import llama_model_path
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="The production T5 layers require CUDA")
+def test_t5_for_conditional_generation_construction_and_forward(monkeypatch):
+    from transformers import T5Config
+    from transformers import \
+        T5ForConditionalGeneration as HFT5ForConditionalGeneration
+
+    from tensorrt_llm._torch.attention.backends.trtllm import \
+        TrtllmAttentionMetadata
+    from tensorrt_llm._torch.models.modeling_t5 import \
+        T5ForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_utils import \
+        get_registered_model_class
+
+    def context_metadata(length):
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=length,
+            kv_cache_manager=None,
+        )
+        metadata.max_seq_len = length
+        metadata.seq_lens = torch.tensor([length], dtype=torch.int32)
+        metadata.num_contexts = 1
+        metadata.request_ids = [0]
+        metadata.prepare()
+        return metadata
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    torch.manual_seed(0)
+    config = T5Config(
+        vocab_size=64,
+        d_model=128,
+        d_kv=64,
+        d_ff=256,
+        num_heads=2,
+        num_layers=1,
+        num_decoder_layers=1,
+        pad_token_id=0,
+        eos_token_id=1,
+        decoder_start_token_id=0,
+        tie_word_embeddings=True,
+        torch_dtype=torch.float16,
+    )
+    config._attn_implementation = "eager"
+    reference = HFT5ForConditionalGeneration(config).cuda().half().eval()
+    model_cls = get_registered_model_class("T5ForConditionalGeneration")
+    assert model_cls is T5ForConditionalGeneration
+    model = model_cls(
+        ModelConfig(pretrained_config=config,
+                    attn_backend="TRTLLM")).cuda().eval()
+    assert isinstance(model, T5ForConditionalGeneration)
+    assert len(model.model.encoder.layers) == 1
+    assert len(model.model.decoder.layers) == 1
+    model.load_weights({
+        name: value.detach().clone()
+        for name, value in reference.state_dict().items()
+    })
+
+    encoder_ids = torch.tensor([3, 7, 11, 5, 9],
+                               dtype=torch.int32,
+                               device="cuda")
+    decoder_ids = torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda")
+    encoder_metadata = context_metadata(encoder_ids.numel())
+    decoder_metadata = context_metadata(decoder_ids.numel())
+    cross_metadata = decoder_metadata.create_cross_metadata(
+        [encoder_ids.numel()])
+    cross_metadata.max_seq_len = encoder_ids.numel()
+    cross_metadata.prepare()
+    assert cross_metadata.is_cross
+
+    with torch.inference_mode():
+        logits = model(
+            attn_metadata=decoder_metadata,
+            input_ids=decoder_ids,
+            encoder_input_ids=encoder_ids,
+            encoder_attn_metadata=encoder_metadata,
+            cross_attn_metadata=cross_metadata,
+            return_context_logits=True,
+        )
+        expected = reference(
+            input_ids=encoder_ids.long().unsqueeze(0),
+            decoder_input_ids=decoder_ids.long().unsqueeze(0),
+            use_cache=False,
+        ).logits.squeeze(0).float()
+
+    assert logits.shape == (decoder_ids.numel(), config.vocab_size)
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits).all()
+    torch.testing.assert_close(logits, expected, rtol=1e-3, atol=1e-2)
+
+
 @pytest.mark.cpu_only
 def test_generation_config_mode_defaults_and_validation() -> None:
     assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
