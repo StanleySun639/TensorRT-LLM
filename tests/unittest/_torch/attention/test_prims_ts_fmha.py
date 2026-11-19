@@ -2451,6 +2451,81 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", ["causal", "variable-window"])
+def test_prims_ts_context_task_manager_builds_schedule_without_gpu(mode: str) -> None:
+    from cutlass.experimental.task_scheduling.schedule_builder import domain_loop, schedule
+    from cutlass.experimental.task_scheduling.task_manager import TaskManager
+
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_context import fmha_kernel
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_context.fmha_kernel import (
+        CausalDomainTask,
+        FmhaTs,
+        VariableWindowDomainTask,
+        build_fmha_task_manager,
+    )
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_context.fmha_tasks import (
+        ContextTask,
+    )
+
+    for task_class in (CausalDomainTask, VariableWindowDomainTask):
+        assert issubclass(task_class, ContextTask)
+        assert task_class.restore_loop_state_outside_loop is True
+
+    @schedule
+    def padding_schedule() -> None:
+        with domain_loop(0, 1, 1):
+            pass
+
+    task = ContextTask(
+        src_resources=[],
+        dst_resources=[],
+        warp_idx=15,
+        num_warps=1,
+        schedule=padding_schedule(),
+        num_registers=32,
+        name="PaddingTask",
+    )
+    assert isinstance(task, ContextTask)
+
+    variable_window = mode == "variable-window"
+    cfg = FmhaTs(
+        d=128,
+        is_persistent=True,
+        is_causal=not variable_window,
+        has_variable_window=variable_window,
+    ).cfg
+    tile_sched_params = fmha_kernel.utils.PersistentTileSchedulerParams(
+        (1, 1, 1),
+        cfg.cluster_shape_mn + (1,),
+    )
+    window_kwargs = {}
+    if variable_window:
+        window_kwargs = {
+            "variable_window_token_starts": torch.zeros(256, dtype=torch.int32),
+            "variable_window_token_ends": torch.full((256,), 511, dtype=torch.int32),
+            "variable_window_cta_starts": torch.zeros(1, dtype=torch.int32),
+            "variable_window_q_stride": 256,
+        }
+
+    task_manager, *_ = build_fmha_task_manager(
+        cfg=cfg,
+        tile_sched_params=tile_sched_params,
+        tma_q_desc=None,
+        tma_k_desc=None,
+        tma_v_desc=None,
+        tma_o_desc=None,
+        cum_seqlen_q=None,
+        cum_seqlen_k=None,
+        num_kv_tiles=4,
+        is_persistent=True,
+        exhaustive_deadlock_race_check=False,
+        **window_kwargs,
+    )
+
+    assert isinstance(task_manager, TaskManager)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("seq_len_kv", [256, 257, 512, 513])
 def test_prims_ts_decode_task_manager_builds_schedule_without_gpu(seq_len_kv: int) -> None:
     pytest.importorskip("cutlass.experimental.task_scheduling")
