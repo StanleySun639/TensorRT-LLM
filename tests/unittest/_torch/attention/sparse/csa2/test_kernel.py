@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,6 +29,41 @@ skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="This test requires Blackwell or newer",
 )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", ["pages_rank", "pages_stride", "block_rows", "empty"])
+def test_candidate_prefetch_host_validation(case, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    glue = Mock(side_effect=AssertionError("Unexpected kernel materialization"))
+    launch = Mock(side_effect=AssertionError("Unexpected kernel launch"))
+    monkeypatch.setattr(kernel, "_glue_kernels", glue)
+    monkeypatch.setattr(kernel, "_launch", launch)
+
+    pages = torch.empty((1, INDEX_PAGE_ROWS, 1, 68), dtype=torch.uint8, device="cpu")
+    table = torch.zeros((1, 1), dtype=torch.int32, device="cpu")
+    blocks = torch.zeros((1, 1), dtype=torch.int32, device="cpu")
+    counts = torch.zeros(1, dtype=torch.int32, device="cpu")
+    block_rows = 4
+    error = "native index pages"
+    if case == "pages_rank":
+        pages = pages.squeeze(2)
+    elif case == "pages_stride":
+        pages = torch.empty((1, INDEX_PAGE_ROWS, 2, 68), dtype=torch.uint8, device="cpu")
+    elif case == "block_rows":
+        block_rows = 3
+        error = "block rows"
+    else:
+        blocks = blocks[:0]
+
+    if case == "empty":
+        assert kernel.prefetch_candidate_blocks_(pages, table, blocks, counts, block_rows) is None
+    else:
+        with pytest.raises(ValueError, match=error):
+            kernel.prefetch_candidate_blocks_(pages, table, blocks, counts, block_rows)
+    glue.assert_not_called()
+    launch.assert_not_called()
 
 
 def _inputs(main_count=73, dtype=torch.int64):
